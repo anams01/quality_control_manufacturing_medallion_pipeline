@@ -24,7 +24,7 @@ from pyspark.sql import functions as F
 # =============================================================================
 
 CATALOG    = "workspace"
-SCHEMA     = "ana_martin17"   # tu schema en Databricks
+SCHEMA     = "quality_control_manufacturing"   # tu schema en Databricks
 VOLUME     = "landing_zone"
 
 BASE_PATH  = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}"

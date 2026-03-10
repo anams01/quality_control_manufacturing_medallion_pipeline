@@ -68,7 +68,7 @@ def silver_inspections_quarantine():
 
 
 # 2. Vista limpia (solo registros válidos)
-@dp.view(name="silver_inspections_clean")
+@dp.table(name="silver_inspections_clean", temporary=True)
 def silver_inspections_clean():
     return (
         dp.read_stream("bronze_inspections")
@@ -116,7 +116,7 @@ def silver_labels_quarantine():
 
 
 # 2. Vista limpia de etiquetas
-@dp.view(name="silver_labels_clean")
+@dp.table(name="silver_labels_clean", temporary=True)
 def silver_labels_clean():
     return (
         dp.read_stream("bronze_labels")

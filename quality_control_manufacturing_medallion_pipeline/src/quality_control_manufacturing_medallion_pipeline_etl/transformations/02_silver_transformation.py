@@ -6,7 +6,7 @@ Capa Plata — Limpieza, validación, cuarentena y enriquecimiento.
 Tablas generadas:
   - silver_inspections_quarantine  : registros que no superan las reglas (DLQ)
   - silver_labels_quarantine       : etiquetas anómalas (DLQ)
-  - silver_inspections             : inspecciones limpias con SCD tipo 2
+  - silver_inspections             : inspecciones limpias
   - silver_labels                  : etiquetas limpias
   - silver_inspections_labeled     : tabla de hechos unificada (stream-stream join)
 """
@@ -26,8 +26,6 @@ VOLUME   = "landing_zone"
 BASE_PATH       = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}"
 CHECKPOINT_BASE = f"{BASE_PATH}/_checkpoints"
 
-# Watermark: máximo retraso observable entre timestamp de inspección
-# y label_available_date (hasta 30 días según diseño del dataset)
 WATERMARK_DELAY = "30 days"
 
 
@@ -36,26 +34,23 @@ WATERMARK_DELAY = "30 days"
 # =============================================================================
 
 def _build_quarantine_flag(rules: dict) -> F.Column:
-    """
-    Construye el flag is_quarantined como la negación de todas las reglas.
-    Un registro está en cuarentena si incumple AL MENOS una regla.
-    """
     all_valid = F.lit(True)
     for rule in rules.values():
         all_valid = all_valid & F.expr(rule["constraint"])
     return (~all_valid).alias("is_quarantined")
 
 
-# =============================================================================
-# INSPECCIONES — Cuarentena + Vista limpia
-# =============================================================================
-
 INSPECTION_RULES = get_rules_by_tag("inspections")
+LABEL_RULES      = get_rules_by_tag("labels")
 
-# 1. Tabla de cuarentena (DLQ)
-@dp.create_streaming_table(
+
+# =============================================================================
+# INSPECCIONES — Cuarentena
+# =============================================================================
+
+@dp.table(
     name="silver_inspections_quarantine",
-    comment="Registros de inspección que no superan las reglas de calidad (Dead Letter Queue).",
+    comment="Registros de inspección que no superan las reglas de calidad (DLQ).",
 )
 def silver_inspections_quarantine():
     return (
@@ -67,9 +62,15 @@ def silver_inspections_quarantine():
     )
 
 
-# 2. Vista limpia (solo registros válidos)
-@dp.table(name="silver_inspections_clean", temporary=True)
-def silver_inspections_clean():
+# =============================================================================
+# INSPECCIONES — Tabla limpia
+# =============================================================================
+
+@dp.table(
+    name="silver_inspections",
+    comment="Inspecciones limpias y validadas.",
+)
+def silver_inspections():
     return (
         spark.readStream.table(f"{CATALOG}.{SCHEMA}.bronze_inspections")
         .withColumn("is_quarantined", _build_quarantine_flag(INSPECTION_RULES))
@@ -78,32 +79,13 @@ def silver_inspections_clean():
     )
 
 
-# 3. Tabla plata final con SCD Tipo 2 via AUTO CDC
-dp.create_streaming_table(
-    name="silver_inspections",
-    comment="Inspecciones limpias y validadas. Histórico completo con SCD Tipo 2.",
-)
-
-dp.create_auto_cdc_flow(
-    name="silver_inspections",
-    source="silver_inspections_clean",
-    keys=["unit_id"],
-    sequence_by="timestamp",
-    stored_as_scd_type=2,
-    except_column_list=["ingestion_timestamp", "source_file"],
-)
-
-
 # =============================================================================
-# ETIQUETAS — Cuarentena + Vista limpia
+# ETIQUETAS — Cuarentena
 # =============================================================================
 
-LABEL_RULES = get_rules_by_tag("labels")
-
-# 1. Cuarentena de etiquetas
-@dp.create_streaming_table(
+@dp.table(
     name="silver_labels_quarantine",
-    comment="Etiquetas de defecto que no superan las reglas de calidad (Dead Letter Queue).",
+    comment="Etiquetas de defecto que no superan las reglas de calidad (DLQ).",
 )
 def silver_labels_quarantine():
     return (
@@ -115,31 +97,21 @@ def silver_labels_quarantine():
     )
 
 
-# 2. Vista limpia de etiquetas
-@dp.table(name="silver_labels_clean", temporary=True)
-def silver_labels_clean():
+# =============================================================================
+# ETIQUETAS — Tabla limpia
+# =============================================================================
+
+@dp.table(
+    name="silver_labels",
+    comment="Etiquetas limpias con delayed feedback validado.",
+)
+def silver_labels():
     return (
         spark.readStream.table(f"{CATALOG}.{SCHEMA}.bronze_labels")
         .withColumn("is_quarantined", _build_quarantine_flag(LABEL_RULES))
         .filter(F.col("is_quarantined") == False)
         .drop("is_quarantined")
     )
-
-
-# 3. Tabla plata de etiquetas
-dp.create_streaming_table(
-    name="silver_labels",
-    comment="Etiquetas limpias con delayed feedback validado.",
-)
-
-dp.create_auto_cdc_flow(
-    name="silver_labels",
-    source="silver_labels_clean",
-    keys=["unit_id"],
-    sequence_by="label_available_date",
-    stored_as_scd_type=1,
-    except_column_list=["ingestion_timestamp", "source_file"],
-)
 
 
 # =============================================================================
@@ -154,9 +126,8 @@ dp.create_auto_cdc_flow(
     ),
 )
 def silver_inspections_labeled():
-    # Inspecciones con watermark
     inspections = (
-        spark.readStream.table(f"{CATALOG}.{SCHEMA}.silver_inspections_clean")
+        spark.readStream.table(f"{CATALOG}.{SCHEMA}.silver_inspections")
         .withWatermark("timestamp", WATERMARK_DELAY)
         .select(
             "unit_id", "timestamp", "machine_id", "line_id", "shift",
@@ -170,14 +141,12 @@ def silver_inspections_labeled():
         )
     )
 
-    # Etiquetas con watermark
     labels = (
-        spark.readStream.table(f"{CATALOG}.{SCHEMA}.silver_labels_clean")
+        spark.readStream.table(f"{CATALOG}.{SCHEMA}.silver_labels")
         .withWatermark("label_available_date", WATERMARK_DELAY)
         .select("unit_id", "is_defective", "label_available_date")
     )
 
-    # LEFT JOIN stream-stream
     return inspections.join(
         labels,
         on="unit_id",

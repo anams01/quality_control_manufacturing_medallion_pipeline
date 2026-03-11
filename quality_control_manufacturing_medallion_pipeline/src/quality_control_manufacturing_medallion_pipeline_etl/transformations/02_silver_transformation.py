@@ -49,12 +49,12 @@ LABEL_RULES      = get_rules_by_tag("labels")
 def silver_inspections_quarantine():
     return (
         spark.readStream.table(f"{CATALOG}.{SCHEMA_TABLES}.bronze_inspections")
+        .withColumn("timestamp", F.to_timestamp(F.col("timestamp")))
         .withColumn("is_quarantined", _build_quarantine_flag(INSPECTION_RULES))
         .filter(F.col("is_quarantined") == True)
         .drop("is_quarantined")
         .withColumn("quarantine_timestamp", F.current_timestamp())
     )
-
 
 # =============================================================================
 # INSPECCIONES — Tabla limpia
@@ -67,6 +67,7 @@ def silver_inspections_quarantine():
 def silver_inspections():
     return (
         spark.readStream.table(f"{CATALOG}.{SCHEMA_TABLES}.bronze_inspections")
+        .withColumn("timestamp", F.to_timestamp(F.col("timestamp")))
         .withColumn("is_quarantined", _build_quarantine_flag(INSPECTION_RULES))
         .filter(F.col("is_quarantined") == False)
         .drop("is_quarantined")

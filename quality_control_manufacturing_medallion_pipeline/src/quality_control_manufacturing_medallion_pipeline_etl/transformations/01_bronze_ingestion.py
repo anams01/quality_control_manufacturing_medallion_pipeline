@@ -21,7 +21,7 @@ from pyspark.sql import functions as F
 # =============================================================================
 
 CATALOG  = "workspace"
-SCHEMA   = "ana_martin17"
+SCHEMA   = "quality_control_manufacturing"
 VOLUME   = "landing_zone"
 
 BASE_PATH          = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}"

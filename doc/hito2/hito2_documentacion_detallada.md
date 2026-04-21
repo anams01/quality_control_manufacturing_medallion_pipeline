@@ -1,10 +1,90 @@
-# Proyecto: Control de Calidad en Manufactura de Componentes Electrónicos
-## Sección 3: Ingeniería de Datos y Arquitectura Medallion
+---
+layout: none
+---
 
-**Autora:** Ana Martín Serrano  
-**Asignatura:** Desarrollo de Sistemas de Big Data  
-**Plataforma:** Azure Databricks (Unity Catalog)  
-**Fecha:** Marzo 2026
+<style>
+  @page {
+    size: A4;
+    margin: 1.5cm;
+}
+
+body {
+    font-family: "Times New Roman", Times, serif;
+    font-size: 11pt;
+    line-height: 1.5;
+    text-align: justify;
+}
+
+h1, h2, h3 {
+    font-family: "Times New Roman", Times, serif;
+    font-weight: bold;
+    color: #1a1a1a;
+}
+
+h1 { font-size: 20pt; margin-bottom: 0.5em; }
+h2 { font-size: 16pt; margin-top: 1em; margin-bottom: 0.4em; }
+h3 { font-size: 14pt; margin-top: 0.8em; margin-bottom: 0.3em; }
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 1em;
+    margin-bottom: 1em;
+}
+
+table, th, td {
+    border: 1px solid #999;
+}
+
+th, td {
+    padding: 6px 10px;
+    text-align: center;
+    font-size: 11pt;
+}
+
+th {
+    background-color: #f2f2f2;
+}
+
+div.portada {
+    text-align: center;
+    margin-top: 150px;
+}
+
+div.portada h1 {
+    font-size: 22pt;
+}
+
+div.portada p {
+    font-size: 12pt;
+    margin: 0.4em 0;
+}
+
+.page-break {
+    page-break-after: always;
+}
+</style>
+
+<div class="portada">
+ 
+
+**Asignatura:** Desarrollo y despliegue de soluciones Big Data  
+**Máster:** Big Data y Análisis de Datos  
+
+<br>
+
+**Estudiante:** Ana Martín Serrano  
+
+<br>
+
+**Fecha de entrega:** Marzo 2026
+
+</div>
+
+<div class="page-break"></div>
+
+
+
 
 ---
 
@@ -133,7 +213,11 @@ Todas las tablas incluyen columnas técnicas de trazabilidad generadas automáti
 - `source_file`: Ruta absoluta del archivo origen de cada registro (`_metadata.file_path`).
 - `_rescued_data`: Captura discrepancias de esquema sin detener la ingesta.
 
-### 3.4.4. Esquema de la Tabla Principal: `bronze_inspections`
+### 3.4.4. Esquemas de las Tablas de la Capa Bronce
+
+A continuación se detalla exhaustivamente la información del esquema de cada una de las tablas generadas en la capa bronce. Además de las columnas específicas documentadas para cada tabla, es importante recordar que **todas** incluyen las variables técnicas de trazabilidad y auditoría descritas en la sección anterior (`ingestion_timestamp` y `source_file`). Comprender estas variables es la base para derivar después nuestras características de aprendizaje automático.
+
+#### Esquema de la Tabla Principal: `bronze_inspections`
 
 | Columna | Tipo | Descripción de negocio |
 |---------|------|----------------------|
@@ -159,6 +243,55 @@ Todas las tablas incluyen columnas técnicas de trazabilidad generadas automáti
 | `production_speed_pct` | DOUBLE | Velocidad de línea como % de la nominal |
 | `operator_experience_yrs` | DOUBLE | Años de experiencia del operario |
 | `cycle_time_s` | DOUBLE | Tiempo de ciclo real en segundos |
+
+#### Esquema de `bronze_labels`
+
+| Columna | Tipo | Descripción de negocio |
+|---------|------|----------------------|
+| `unit_id` | STRING | Identificador de la unidad productiva |
+| `is_defective` | INTEGER | Variable binaria objetivo (0 = Válida, 1 = Defectuosa) |
+| `label_available_date` | TIMESTAMP | Instante en que la etiqueta se hace verdaderamente disponible (delayed feedback) |
+
+#### Esquemas Estáticos de Contexto
+
+**1. `bronze_machines`**
+| Columna | Tipo | Descripción de negocio |
+|---------|------|----------------------|
+| `machine_id` | STRING | Identificador único de la máquina (ej: MAC_01) |
+| `machine_type` | STRING | Clasificación y modelo de la maquinaria utilizada |
+| `line_id` | STRING | Línea de producción a la cual ha sido asignada físicamente |
+| `installation_date` | DATE | Fecha de puesta en marcha inicial en la planta |
+| `vibration_baseline_mm_s`| DOUBLE | Umbral nominal de vibración esperada para uso como límite o benchmark |
+
+**2. `bronze_lines`**
+| Columna | Tipo | Descripción de negocio |
+|---------|------|----------------------|
+| `line_id` | STRING | Identificador de la línea (LINE_A a LINE_D) |
+| `daily_capacity` | INTEGER | Meta técnica de capacidad productiva por día |
+| `clean_room_class` | STRING | Clase o nivel de certificación de sala limpia (ej: Class 100) |
+
+**3. `bronze_suppliers`**
+| Columna | Tipo | Descripción de negocio |
+|---------|------|----------------------|
+| `supplier_id` | STRING | Código único del proveedor de materiales (ej. SUP_ALPHA) |
+| `start_date` | DATE | Fecha en que el proveedor comenzó a proveer recursos |
+| `expected_quality` | DOUBLE | Ratio promedio o métrica estándar esperada a nivel histórico |
+| `solder_thickness_mean_um` | DOUBLE | Referencia técnica de grosor aportada según especificación de materiales |
+
+**4. `bronze_operators`**
+| Columna | Tipo | Descripción de negocio |
+|---------|------|----------------------|
+| `operator_id` | STRING | Código único identificador de empleado operario |
+| `experience_level` | STRING | Nivel de destreza profesional según antigüedad (ej. Jr, SSR, Sr) |
+| `shift` | STRING | Turno administrativo formal que se le ha fijado |
+
+**5. `bronze_maintenance`**
+| Columna | Tipo | Descripción de negocio |
+|---------|------|----------------------|
+| `maintenance_id` | STRING | Identificador del evento de reparación o calibración |
+| `machine_id` | STRING | Máquina a la cual se le aplicó el soporte |
+| `maintenance_date` | TIMESTAMP | Fecha y hora en que se consumó la intervención |
+| `maintenance_type` | STRING | Tipología de mantenimiento operativo (preventivo vs correctivo) |
 
 ---
 
@@ -367,6 +500,6 @@ bronze_labels      ──────►                             gold_inspec
 
 ---
 
-> Nota: [DataBricks URL](https://dbc-b6d08693-29d5.cloud.databricks.com/browse/folders/536399241519399?o=7474647125702341)
+> Enlaces: [DataBricks URL](https://dbc-b6d08693-29d5.cloud.databricks.com/browse/folders/536399241519399?o=7474647125702341)
 
-> [Repositorio Github](https://github.com/anams01/DDSBD_Practica.git)
+> [Repositorio Github](https://github.com/anams01/quality_control_manufacturing_medallion_pipeline.git)

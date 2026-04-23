@@ -25,9 +25,33 @@
 
 # COMMAND ----------
 
+
 from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
 from datetime import datetime, timezone
 from pyspark.sql.functions import col, count, max, round, when
+
+# === BLOQUE PARA CREAR TABLA ESTÁTICA LISTA PARA FEATURE STORE ===
+catalog = "workspace"
+database = "ana_martin17"
+src_table = f"{catalog}.{database}.gold_inspection_spine"
+dst_table = f"{catalog}.{database}.gold_inspection_spine_static"
+
+# Cargar la tabla streaming y filtrar nulos
+df = spark.table(src_table).filter("unit_id IS NOT NULL")
+
+# Sobrescribe la tabla estática
+df.write.mode("overwrite").format("delta").saveAsTable(dst_table)
+
+# Asegura que unit_id es NOT NULL y añade la clave primaria
+spark.sql(f"""
+ALTER TABLE {dst_table}
+ALTER COLUMN unit_id SET NOT NULL
+""")
+
+spark.sql(f"""
+ALTER TABLE {dst_table}
+ADD CONSTRAINT gold_inspection_spine_static_pk PRIMARY KEY (unit_id)
+""")
 
 # COMMAND ----------
 

@@ -3,9 +3,9 @@
 # MAGIC
 # MAGIC # Experimentación con `MLflow`
 # MAGIC
-# MAGIC **Autor**: Juan Carlos Alfaro Jiménez
+# MAGIC **Autor**: Juan Carlos Alfaro Jiménez (adaptado para manufacturing quality control)
 # MAGIC
-# MAGIC Esta libreta cubre la primera fase del ciclo `MLOps` profesional: **búsqueda de hiperparámetros usando los conjuntos de entrenamiento y validación**.
+# MAGIC Esta libreta cubre la primera fase del ciclo `MLOps` profesional: **búsqueda de hiperparámetros usando los conjuntos de entrenamiento y validación** para optimizar la **detección de defectos en componentes electrónicos**.
 # MAGIC
 # MAGIC El entrenamiento de cada modelo se delega en `07_Training_Job.ipynb` y la evaluación de métricas y generación de artefactos en `07_Evaluation_Job.ipynb`. Ambas se ejecutan en sesiones de `Spark Connect` completamente nuevas a través de `dbutils.notebook.run()`. Esta libreta se encarga exclusivamente de la instrumentación de `MLflow`.
 # MAGIC

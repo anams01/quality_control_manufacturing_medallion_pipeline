@@ -3,7 +3,7 @@
 # MAGIC
 # MAGIC # Evaluación universal de modelos
 # MAGIC
-# MAGIC **Autor**: Juan Carlos Alfaro Jiménez
+# MAGIC **Autor**: Juan Carlos Alfaro Jiménez (adaptado para manufacturing quality control)
 # MAGIC
 # MAGIC Esta libreta actúa como un **evaluador agnóstico e independiente** y no contiene ninguna llamada a `MLflow`. Su única responsabilidad es recibir la ruta de un modelo físico ya entrenado (`PipelineModel`), aplicarlo sobre la partición de datos que se le solicite (entrenamiento, validación o prueba), calcular las métricas de rendimiento y generar las figuras de diagnóstico. Finalmente, guarda los artefactos resultantes en un volumen de `Unity Catalog`.
 # MAGIC
@@ -20,6 +20,8 @@
 # MAGIC ## 1. Importaciones y carga de utilidades compartidas
 # MAGIC
 # MAGIC El *script* `07_Utils.py` actúa como nuestra caja de herramientas central. A diferencia de la libreta de entrenamiento, en esta sesión **sí haremos un uso intensivo de toda la lógica matemática de evaluación y de las funciones de generación de figuras de diagnóstico** (curvas *PR*, curvas *ROC*, matrices de confusión y curvas de calibración) que dejamos allí encapsuladas.
+# MAGIC
+# MAGIC Este script ha sido adaptado específicamente para el contexto de **detección de defectos en componentes electrónicos**, manteniendo la misma arquitectura que el baseline de fraude.
 # MAGIC
 # MAGIC A continuación, importamos las librerías necesarias **exclusivamente** para la carga del modelo, la inferencia y la serialización de resultados.
 
@@ -46,7 +48,7 @@ from sklearn.metrics import classification_report
 # MAGIC Al igual que en `07_Training_Job.ipynb`, la libreta orquestadora inyecta todos los valores mediante el parámetro `arguments` de `dbutils.notebook.run()`, y todos llegan como cadenas de texto que deben convertirse explícitamente:
 # MAGIC
 # MAGIC * **`model_artifact_uri`**: `URI` del artefacto del modelo.
-# MAGIC * **`evaluation_dataset`**: Partición sobre la que se evaluará el modelo: `train`, `validation` o `test`.
+# MAGIC * **`evaluation_dataset`**: Partición sobre la que se evaluará el modelo: `train`, `validation` o `test`. En nuestro contexto, evaluamos la capacidad del modelo para detectar defectos.
 # MAGIC * **`evaluation_tag`**: Identificador único de esta evaluación, usado para nombrar los directorios de artefactos en el volumen.
 
 # COMMAND ----------
@@ -73,9 +75,9 @@ print(f"Evaluation tag: {evaluation_tag}")
 # MAGIC
 # MAGIC A diferencia del proceso de entrenamiento (que fusiona particiones para maximizar el aprendizaje), esta libreta actúa como un juez estricto. Utilizando el parámetro `evaluation_dataset`, seleccionará dinámicamente la partición correspondiente a la fase del ciclo de vida en curso:
 # MAGIC
-# MAGIC * **`train`**: Evalúa sobre el conjunto de entrenamiento. Se utiliza en la fase de experimentación para calcular la brecha de generalización junto con la evaluación sobre validación.
-# MAGIC * **`validation`**: Evalúa sobre el conjunto de validación. Es el modo estándar durante el *grid search* para seleccionar el mejor modelo sin contaminar el conjunto de prueba.
-# MAGIC * **`test`**: Evalúa sobre el conjunto de prueba. Se reserva exclusivamente para la comparación final entre `challenger` y `champion` en la fase de producción.
+# MAGIC * **`train`**: Evalúa sobre el conjunto de entrenamiento (inspecciones de entrenamiento). Se utiliza para calcular la brecha de generalización junto con la evaluación sobre validación.
+# MAGIC * **`validation`**: Evalúa sobre el conjunto de validación (inspecciones no vistas durante entrenamiento). Es el modo estándar durante el *grid search* para seleccionar el mejor modelo sin contaminar el conjunto de prueba.
+# MAGIC * **`test`**: Evalúa sobre el conjunto de prueba (inspecciones completamente reservadas). Se reserva exclusivamente para la comparación final entre `challenger` y `champion` en la fase de producción.
 
 # COMMAND ----------
 
@@ -129,7 +131,7 @@ print(f"Accuracy: {eval_metrics['accuracy']:.4f}")
 eval_pandas_df = to_pandas_predictions(eval_predictions)
 
 y_eval = eval_pandas_df[label_column].values
-p_eval = eval_pandas_df[prob_fraud_column].values
+p_eval = eval_pandas_df[prob_defective_column].values
 pred_eval = eval_pandas_df[prediction_column].values
 
 best_threshold, best_f1_score = find_best_threshold(y_eval, p_eval)
@@ -189,7 +191,7 @@ print("All diagnostic figures generated and saved successfully.")
 
 # COMMAND ----------
 
-target_names = ["Legit", "Fraud"]
+target_names = ["Good", "Defective"]
 
 report_path = str(Path(eval_tmp_path) / "classification_report.txt")
 

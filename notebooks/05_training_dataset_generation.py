@@ -97,12 +97,9 @@ nulls.show(vertical=True, truncate=False)
 training_df.groupBy("is_defective").count().show()
 
 # ===============================
-# 3. PERSISTENCIA DEL DATASET FINAL
+# 2. COMPROBACIONES de spark
 # ===============================
-final_table = f"{catalog}.{database}.gold_inspection_training_dataset"
-training_df.write.mode("overwrite").format("delta").saveAsTable(final_table)
 
-# Puedes añadir aquí la escritura de metadatos de trazabilidad si lo deseas
 spark.sql("""
 ALTER TABLE workspace.ana_martin17.gold_machine_profile
 ADD CONSTRAINT gold_machine_profile_pk PRIMARY KEY (machine_id)
@@ -117,6 +114,15 @@ spark.sql("""
 ALTER TABLE workspace.ana_martin17.gold_machine_agg_24h
 ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id, window_end)
 """)
+
+
+# ===============================
+# 3. PERSISTENCIA DEL DATASET FINAL
+# ===============================
+final_table = f"{catalog}.{database}.gold_inspection_training_dataset"
+training_df.write.mode("overwrite").format("delta").saveAsTable(final_table)
+
+# Puedes añadir aquí la escritura de metadatos de trazabilidad si lo deseas
 
 # Asegura que unit_id es NOT NULL y añade la clave primaria (solo si no existe)
 spark.sql(f"""

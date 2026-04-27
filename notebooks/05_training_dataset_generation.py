@@ -71,6 +71,27 @@ agg_24h_lookup = FeatureLookup(
     timestamp_lookup_key="timestamp"
 )
 
+
+# ===============================
+# 2. COMPROBACIONES de spark
+# ===============================
+
+spark.sql("""
+ALTER TABLE workspace.ana_martin17.gold_machine_profile
+ADD CONSTRAINT gold_machine_profile_pk PRIMARY KEY (machine_id)
+""")
+
+spark.sql("""
+ALTER TABLE workspace.ana_martin17.gold_machine_agg_1h
+ADD CONSTRAINT gold_machine_agg_1h_pk PRIMARY KEY (machine_id, window_end)
+""")
+
+spark.sql("""
+ALTER TABLE workspace.ana_martin17.gold_machine_agg_24h
+ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id, window_end)
+""")
+
+
 # Crear el training set con join PiT
 training_set = fe.create_training_set(
     df=spark.table(spine_table),
@@ -96,24 +117,7 @@ nulls.show(vertical=True, truncate=False)
 # Balance de clases
 training_df.groupBy("is_defective").count().show()
 
-# ===============================
-# 2. COMPROBACIONES de spark
-# ===============================
 
-spark.sql("""
-ALTER TABLE workspace.ana_martin17.gold_machine_profile
-ADD CONSTRAINT gold_machine_profile_pk PRIMARY KEY (machine_id)
-""")
-
-spark.sql("""
-ALTER TABLE workspace.ana_martin17.gold_machine_agg_1h
-ADD CONSTRAINT gold_machine_agg_1h_pk PRIMARY KEY (machine_id, window_end)
-""")
-
-spark.sql("""
-ALTER TABLE workspace.ana_martin17.gold_machine_agg_24h
-ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id, window_end)
-""")
 
 
 # ===============================

@@ -385,24 +385,26 @@ print("Training dataset created successfully.")
 # COMMAND ----------
 
 # DBTITLE 1,Untitled
-from pyspark.sql import Window
-from pyspark.sql.functions import sum as spark_sum
-
-# Compute class balance directly without full count
-print("Class balance (Defects):")
-class_balance_df = (
-    training_df.groupBy(label)
-               .count()
-               .withColumn("pct", round(col("count") / spark_sum("count").over(Window.partitionBy()) * 100, 2))
-               .orderBy(label)
-)
-
-class_balance_rows = class_balance_df.collect()
-total_count = sum(row['count'] for row in class_balance_rows)
-
-print(f"Total rows: {total_count:,}\n")
-for row in class_balance_rows:
-    print(f"Defect {row[label]}: {row['count']:,} rows ({row['pct']}%)")
+# Read from the materialized table instead of triggering joins again
+# This assumes cell 15 successfully wrote the table
+try:
+    materialized_df = spark.table(gold_training_dataset_table)
+    total_count = materialized_df.count()
+    
+    print(f"Total rows: {total_count:,}\n")
+    print("Class balance (Defects):")
+    
+    class_balance_df = (
+        materialized_df.groupBy(label)
+                      .count()
+                      .withColumn("pct", round(col("count") / total_count * 100, 2))
+                      .orderBy(label)
+    )
+    
+    class_balance_df.show()
+except Exception as e:
+    print(f"Table not yet materialized. Error: {str(e)}")
+    print("Please run cell 15 first to persist the training dataset.")
 
 # COMMAND ----------
 
@@ -411,21 +413,98 @@ for row in class_balance_rows:
 
 # COMMAND ----------
 
-# Filtramos filas sin etiqueta
+# DBTITLE 1,Cell 15 (Alternative: Manual Joins)
+# ALTERNATIVE APPROACH: Manual joins (often faster than Feature Engineering API)
+# This bypasses the FE API overhead for one-time materialization
+
+print("Using manual joins for faster materialization...\n")
+
+# Start with spine
+df_result = spine_df.filter("is_defective IS NOT NULL")
+
+print(f"Starting rows: {df_result.count():,}")
+
+# Join 1: Machine profile
+df_result = df_result.join(
+    spark.table(machine_profile_static),
+    "machine_id",
+    "left"
+)
+print("✓ Joined machine profile")
+
+# Join 2: Supplier profile  
+df_result = df_result.join(
+    spark.table(supplier_profile_static),
+    "supplier_id",
+    "left"
+)
+print("✓ Joined supplier profile")
+
+# Join 3: Machine agg 1h
+df_result = df_result.join(
+    spark.table(machine_agg_1h_static),
+    "machine_id",
+    "left"
+)
+print("✓ Joined 1h aggregations")
+
+# Join 4: Machine agg 24h
+df_result = df_result.join(
+    spark.table(machine_agg_24h_static),
+    "machine_id",
+    "left"
+)
+print("✓ Joined 24h aggregations")
+
+# Drop excluded columns
+if "label_available_date" in df_result.columns:
+    df_result = df_result.drop("label_available_date")
+
+# Optimize and write
+print("\nWriting to Delta table...")
+df_result.repartition(200).write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .option("delta.autoOptimize.optimizeWrite", "true") \
+    .saveAsTable(gold_training_dataset_table)
+
+print(f"\n✓ Training dataset materialized: {gold_training_dataset_table}")
+print(f"✓ Columns: {len(df_result.columns)}")
+print(f"✓ Row count: {spark.table(gold_training_dataset_table).count():,}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 15
+# Increase timeout for large dataset materialization
+spark.conf.set("spark.databricks.execution.timeout", "14400")  # 4 hours
+
+print(f"Materializing training dataset with 30M spine rows...")
+print("Timeout increased to 4 hours. This operation may take 30-60 minutes.\n")
+
+# Filter nulls
 clean_training_df = training_df.filter("is_defective IS NOT NULL")
 
-# Almacenado como tabla estática en Delta
+# Repartition to optimize write performance
+optimized_df = clean_training_df.repartition(200)
+
+# Write with optimizations
+print("Starting write operation...")
 (
-    clean_training_df
+    optimized_df
     .write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .option("delta.enableChangeDataFeed", "true")
+    .option("delta.autoOptimize.optimizeWrite", "true")
+    .option("delta.autoOptimize.autoCompact", "true")
     .saveAsTable(gold_training_dataset_table)
 )
 
-print(f"Training dataset materializado y listo en: {gold_training_dataset_table}")
+print(f"✓ Training dataset materialized: {gold_training_dataset_table}")
+final_count = spark.table(gold_training_dataset_table).count()
+print(f"✓ Row count: {final_count:,}")
 
 # COMMAND ----------
 

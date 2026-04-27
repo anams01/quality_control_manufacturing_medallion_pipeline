@@ -2,9 +2,9 @@
 # MAGIC %md
 # MAGIC # Evaluación en producción y promoción del modelo
 # MAGIC
-# MAGIC **Autor**: Juan Carlos Alfaro Jiménez
+# MAGIC **Autor**: Juan Carlos Alfaro Jiménez (adaptado para manufacturing quality control)
 # MAGIC
-# MAGIC Esta libreta cubre la segunda fase del ciclo `MLOps` profesional: **evaluación del modelo candidato sobre el conjunto de prueba y decisión de promoción**.
+# MAGIC Esta libreta cubre la segunda fase del ciclo `MLOps` profesional: **evaluación del modelo candidato sobre el conjunto de prueba y decisión de promoción** para la **detección de defectos en componentes electrónicos**.
 # MAGIC
 # MAGIC El flujo de aliases que gobierna este proceso es el siguiente:
 # MAGIC
@@ -18,7 +18,7 @@
 # MAGIC
 # MAGIC ### ¿Por qué evaluar sobre el conjunto de prueba aquí y no antes?
 # MAGIC
-# MAGIC El conjunto de prueba es un recurso **de un solo uso**: contiene las transacciones más recientes del conjunto de datos, nunca vistas durante el entrenamiento ni la validación. Cualquier decisión tomada observando los datos de prueba (aunque sea indirectamente) introduciría un sesgo de selección. Por este motivo, el conjunto de prueba solo se usa en esta libreta, que se ejecuta únicamente cuando ya existe un candidato validado y listo para comparar.
+# MAGIC El conjunto de prueba es un recurso **de un solo uso**: contiene las inspecciones más recientes del conjunto de datos, nunca vistas durante el entrenamiento ni la validación. Cualquier decisión tomada observando los datos de prueba (aunque sea indirectamente) introduciría un sesgo de selección. Por este motivo, el conjunto de prueba solo se usa en esta libreta, que se ejecuta únicamente cuando ya existe un candidato validado y listo para comparar.
 # MAGIC
 # MAGIC Para garantizar una comparación justa, el `challenger` se retrenará previamente sobre entrenamiento y validación (los mismos datos que el `champion` vio en su ciclo), antes de ser evaluado. Una vez tomada la decisión de promoción, el modelo ganador se retrenará sobre el histórico completo (entrenamiento, validación y prueba) antes de ser registrado como `champion`, ya que la evaluación ha cumplido su función y el conjunto de prueba deja de estar reservado.
 
@@ -187,7 +187,7 @@ else:
 # MAGIC
 # MAGIC ## 6. Reentrenamiento del `challenger` sobre el conjunto de entrenamiento y validación
 # MAGIC
-# MAGIC Antes de evaluar el `challenger` sobre el conjunto de prueba, lo reentrenamos usando **todos los datos que no son de prueba**; es decir, el conjunto de entrenamiento más el de validación unidos. **Este paso es metodológicamente necesario porque el modelo que compite en prueba debe haber aprendido de todos los datos disponibles antes del corte temporal de prueba.** El modelo que salió del *grid search* solo vio el conjunto de entrenamiento. El conjunto de validación, aunque no se usó para ajustar los pesos, sí influyó indirectamente en la selección de hiperparámetros. Reentrenando con ambos, el modelo aprovecha todo el dato histórico disponible sin contaminar el conjunto de prueba.
+# MAGIC Antes de evaluar el `challenger` sobre el conjunto de prueba, lo reentrenamos usando **todos los datos que no son de prueba**; es decir, el conjunto de entrenamiento más el de validación unidos. **Este paso es metodológicamente necesario porque el modelo que compite en prueba debe haber aprendido de todas las inspecciones disponibles antes del corte temporal de prueba.** El modelo que salió del *grid search* solo vio el conjunto de entrenamiento. El conjunto de validación, aunque no se usó para ajustar los pesos, sí influyó indirectamente en la selección de hiperparámetros. Reentrenando con ambos, el modelo aprovecha todo el dato histórico disponible sin contaminar el conjunto de prueba.
 # MAGIC
 # MAGIC Los hiperparámetros del reentrenamiento son exactamente los mismos que seleccionó el *grid search*; no se toma ninguna decisión nueva. El conjunto de prueba sigue sin tocarse.
 
@@ -343,7 +343,7 @@ print(f"Reason: {decision_reason}")
 # MAGIC
 # MAGIC ## 10. Reentrenamiento final y actualización de aliases en `Unity Catalog`
 # MAGIC
-# MAGIC Si el `challenger` gana, se realiza un reentrenamiento final sobre el histórico completo (entrenamiento, validación y prueba) antes de registrarlo como `champion`. Este paso garantiza que el modelo desplegado haya aprendido de las tácticas de fraude más recientes, incluyendo las del conjunto de prueba que ya ha cumplido su función evaluativa.
+# MAGIC Si el `challenger` gana, se realiza un reentrenamiento final sobre el histórico completo (entrenamiento, validación y prueba) antes de registrarlo como `champion`. Este paso garantiza que el modelo desplegado haya aprendido de los patrones de defectos más recientes, incluyendo los del conjunto de prueba que ya ha cumplido su función evaluativa.
 # MAGIC
 # MAGIC Una vez registrada la nueva versión, se escribe su descripción en `Unity Catalog` con las métricas de prueba y los hiperparámetros clave, de forma que cualquier versión `champion` sea autoexplicativa sin necesidad de consultar el run de `MLflow`. Los cambios de alias se aplican a continuación sobre esta versión, no sobre la del `challenger` evaluado.
 
@@ -427,7 +427,7 @@ except Exception:
 # MAGIC
 # MAGIC Cuando el `challenger` gana, se escribe el conjunto de prueba con las predicciones del `champion` como tabla `Delta` en `Unity Catalog`. Esta tabla actúa como *baseline* del monitor de `Databricks Lakehouse Monitoring`, permitiendo comparar tanto la distribución de características como las métricas de rendimiento en producción contra el mismo referente que se usó para la decisión de promoción.
 # MAGIC
-# MAGIC El conjunto de prueba es el *baseline* correcto por dos razones: es el único conjunto sobre el que existen métricas imparciales (las mismas guardadas como `test_auc_pr` en el *tag* de la versión `champion`), y contiene las transacciones temporalmente más recientes, que son el mejor *proxy* de la distribución real esperada en producción. Las columnas internas de `Spark ML` (`features`, `rawPrediction` y `probability`) se descartan antes de persistir, conservando únicamente las características originales, la etiqueta y las columnas de predicción.
+# MAGIC El conjunto de prueba es el *baseline* correcto por dos razones: es el único conjunto sobre el que existen métricas imparciales (las mismas guardadas como `test_auc_pr` en el *tag* de la versión `champion`), y contiene las inspecciones temporalmente más recientes, que son el mejor *proxy* de la distribución real esperada en producción. Las columnas internas de `Spark ML` (`features`, `rawPrediction` y `probability`) se descartan antes de persistir, conservando únicamente las características originales, la etiqueta y las columnas de predicción.
 
 # COMMAND ----------
 
@@ -440,7 +440,7 @@ if challenger_wins:
             champion_pipeline
             .transform(test_df)
             .withColumn(
-                prob_fraud_column,
+                prob_defective_column,
                 vector_to_array(F.col(probability_column)).getItem(1)
             )
             .withColumn(
@@ -458,7 +458,7 @@ if challenger_wins:
             .select(
                 *test_df.columns,
                 prediction_column,
-                prob_fraud_column,
+                prob_defective_column,
                 model_version_col,
                 inference_timestamp_col
             )
@@ -482,7 +482,7 @@ else:
 # MAGIC
 # MAGIC ### 11.1. Registro de metadatos en `Unity Catalog`
 # MAGIC
-# MAGIC Al igual que `gold_fraud_training_dataset`, la tabla `gold_fraud_test_baseline` recibe metadatos de trazabilidad como etiquetas visibles en la interfaz de `Unity Catalog` y como propiedades de tabla legibles programáticamente. Esto garantiza que cualquier consulta futura sobre el *baseline* pueda identificar inequívocamente qué modelo generó esas predicciones, en qué ciclo de producción y sobre qué partición temporal de los datos.
+# MAGIC Al igual que `gold_inspection_training_dataset`, la tabla `gold_inspection_test_baseline` recibe metadatos de trazabilidad como etiquetas visibles en la interfaz de `Unity Catalog` y como propiedades de tabla legibles programáticamente. Esto garantiza que cualquier consulta futura sobre el *baseline* pueda identificar inequívocamente qué modelo generó esas predicciones, en qué ciclo de producción y sobre qué partición temporal de los datos.
 
 # COMMAND ----------
 
@@ -596,8 +596,8 @@ cleanup_temporary_artifacts(uc_volume_path)
 # MAGIC 3. **Evaluación aislada**: Delegamos la evaluación de cada modelo a `07_Evaluation_Job.ipynb` mediante `dbutils.notebook.run()`, evitando el error de caché de `Spark Connect` y garantizando que cada modelo se evalúa en una sesión completamente limpia.
 # MAGIC 4. **Decisión reproducible**: La comparación se basa exclusivamente en `test_auc_pr`, la métrica más robusta para problemas con fuerte desbalance de clases. La decisión queda registrada en `MLflow` junto con las métricas completas de ambos modelos, formando un registro auditable de cada ciclo de producción.
 # MAGIC 5. **Conjunto de prueba intocable**: El conjunto de prueba solo se usó aquí, nunca durante la fase de experimentación del `07`, preservando su integridad como estimador imparcial del rendimiento real.
-# MAGIC 6. **Reentrenamiento final sobre el histórico completo**: Cuando el `challenger` gana, el modelo registrado como `champion` no es el evaluado en prueba sino uno reentrenado sobre entrenamiento, validación y prueba. Esto garantiza que el sistema en producción haya aprendido de las tácticas de fraude más recientes antes del despliegue, mitigando el *concept drift*.
-# MAGIC 7. ***Baseline* para monitorización**: Cuando el `challenger` gana, el conjunto de prueba transformado por el `champion` se persiste en `Unity Catalog` como tabla `Delta` (`gold_fraud_test_baseline`), incluyendo todas las características originales, la etiqueta y las columnas de predicción. Esta tabla actúa como referente del monitor de `Databricks Lakehouse Monitoring`, permitiendo calcular tanto *data drift* de características como métricas de rendimiento en producción, comparadas contra el mismo estándar que determinó la promoción del modelo.
+# MAGIC 6. **Reentrenamiento final sobre el histórico completo**: Cuando el `challenger` gana, el modelo registrado como `champion` no es el evaluado en prueba sino uno reentrenado sobre entrenamiento, validación y prueba. Esto garantiza que el sistema en producción haya aprendido de los patrones de defectos más recientes antes del despliegue, mitigando el *concept drift*.
+# MAGIC 7. ***Baseline* para monitorización**: Cuando el `challenger` gana, el conjunto de prueba transformado por el `champion` se persiste en `Unity Catalog` como tabla `Delta` (`gold_inspection_test_baseline`), incluyendo todas las características originales, la etiqueta y las columnas de predicción. Esta tabla actúa como referente del monitor de `Databricks Lakehouse Monitoring`, permitiendo calcular tanto *data drift* de características como métricas de rendimiento en producción, comparadas contra el mismo estándar que determinó la promoción del modelo.
 # MAGIC
 # MAGIC ### ¿Cuándo volver a ejecutar esta libreta?
 # MAGIC

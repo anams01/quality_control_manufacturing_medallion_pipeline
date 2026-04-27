@@ -1,5 +1,6 @@
 """
 Shared `MLflow` utilities for the production evaluation and promotion pipeline.
+Adapted for manufacturing quality control and defect detection.
 """
 
 
@@ -40,7 +41,7 @@ evaluation_max_retries = 3
 # Table configuration
 ###############################################################################
 
-baseline_table_name = f"{catalog}.{database}.gold_fraud_test_baseline"
+baseline_table_name = f"{catalog}.{database}.gold_inspection_test_baseline"
 
 
 ###############################################################################

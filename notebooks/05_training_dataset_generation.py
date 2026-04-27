@@ -39,14 +39,87 @@ dst_table = f"{catalog}.{database}.gold_inspection_spine_static"
 # Cargar la tabla streaming y filtrar nulos
 df = spark.table(src_table).filter("unit_id IS NOT NULL")
 
-# Sobrescribe la tabla estática
-df.write.mode("overwrite").format("delta").saveAsTable(dst_table)
 
-# Asegura que unit_id es NOT NULL y añade la clave primaria
+# ===============================
+# 1. GENERACIÓN DEL DATASET DE ENTRENAMIENTO CON JOIN PiT
+# ===============================
+from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
+
+# Instancia del cliente de Feature Store
+fe = FeatureEngineeringClient()
+
+# Tabla spine (ya estática y con PK)
+spine_table = dst_table
+
+# Definir los FeatureLookup para cada tabla de características
+machine_profile_lookup = FeatureLookup(
+    table_name=f"{catalog}.{database}.gold_machine_profile",
+    feature_names=None,  # Todas las columnas excepto la PK
+    lookup_key=["machine_id"],
+    timestamp_lookup_key=None  # No es temporal
+)
+agg_1h_lookup = FeatureLookup(
+    table_name=f"{catalog}.{database}.gold_machine_agg_1h",
+    feature_names=None,
+    lookup_key=["machine_id"],
+    timestamp_lookup_key="timestamp"  # Join temporal
+)
+agg_24h_lookup = FeatureLookup(
+    table_name=f"{catalog}.{database}.gold_machine_agg_24h",
+    feature_names=None,
+    lookup_key=["machine_id"],
+    timestamp_lookup_key="timestamp"
+)
+
+# Crear el training set con join PiT
+training_set = fe.create_training_set(
+    df=spark.table(spine_table),
+    feature_lookups=[machine_profile_lookup, agg_1h_lookup, agg_24h_lookup],
+    label="is_defective",
+    exclude_columns=["label_available_date"],  # Excluye metadatos no disponibles en inferencia
+    # Si tienes más columnas a excluir, añádelas aquí
+)
+
+# Materializa el DataFrame enriquecido
+training_df = training_set.load_df()
+
+# ===============================
+# 2. COMPROBACIONES DE CALIDAD
+# ===============================
+print(f"Filas en spine: {spark.table(spine_table).count()}")
+print(f"Filas en training_df: {training_df.count()}")
+
+# Nulos por columna
+nulls = training_df.select([F.count(F.when(F.col(c).isNull(), c)).alias(c) for c in training_df.columns])
+nulls.show(vertical=True, truncate=False)
+
+# Balance de clases
+training_df.groupBy("is_defective").count().show()
+
+# ===============================
+# 3. PERSISTENCIA DEL DATASET FINAL
+# ===============================
+final_table = f"{catalog}.{database}.gold_inspection_training_dataset"
+training_df.write.mode("overwrite").format("delta").saveAsTable(final_table)
+
+# Puedes añadir aquí la escritura de metadatos de trazabilidad si lo deseas
+
+# Asegura que unit_id es NOT NULL y añade la clave primaria (solo si no existe)
 spark.sql(f"""
 ALTER TABLE {dst_table}
 ALTER COLUMN unit_id SET NOT NULL
 """)
+
+# Elimina la constraint si ya existe, para evitar error de duplicado
+try:
+    spark.sql(f"ALTER TABLE {dst_table} DROP CONSTRAINT gold_inspection_spine_static_pk")
+except Exception as e:
+    if "does not exist" in str(e):
+        pass  # No pasa nada si no existe
+    elif "not found" in str(e):
+        pass
+    else:
+        raise
 
 spark.sql(f"""
 ALTER TABLE {dst_table}

@@ -93,6 +93,11 @@ ALTER TABLE {agg_1h_table}
 ALTER COLUMN machine_id SET NOT NULL
 """)
 
+spark.sql(f"""
+ALTER TABLE {agg_1h_table}
+ALTER COLUMN window_end SET NOT NULL
+""")
+
 try:
     spark.sql(f"ALTER TABLE {agg_1h_table} DROP CONSTRAINT gold_machine_agg_1h_pk")
 except:
@@ -113,6 +118,11 @@ SELECT * FROM {catalog}.{database}.gold_machine_agg_24h
 spark.sql(f"""
 ALTER TABLE {agg_24h_table}
 ALTER COLUMN machine_id SET NOT NULL
+""")
+
+spark.sql(f"""
+ALTER TABLE {agg_24h_table}
+ALTER COLUMN window_end SET NOT NULL
 """)
 
 try:

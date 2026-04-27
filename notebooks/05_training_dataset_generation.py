@@ -29,7 +29,6 @@
 from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
 from datetime import datetime, timezone
 from pyspark.sql.functions import col, count, max, round, when
-import pyspark.sql.functions as F
 
 # === BLOQUE PARA CREAR TABLA ESTÁTICA LISTA PARA FEATURE STORE ===
 catalog = "workspace"
@@ -40,16 +39,11 @@ dst_table = f"{catalog}.{database}.gold_inspection_spine_static"
 # Cargar la tabla streaming y filtrar nulos
 df = spark.table(src_table).filter("unit_id IS NOT NULL")
 
-# Guardar spine como tabla estática (ya filtrada y lista para Feature Store)
-spine_enriched_table = f"{catalog}.{database}.gold_inspection_spine_static_enriched"
-df.write.mode("overwrite").saveAsTable(spine_enriched_table)
-
 # Instancia del cliente de Feature Store
-from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
 fe = FeatureEngineeringClient()
 
-# Tabla spine (con timestamp para point-in-time joins)
-spine_table = spine_enriched_table
+# Tabla spine
+spine_table = src_table
 
 # ===============================
 # CONVERTIR VISTAS A TABLAS ESTÁTICAS CON CONSTRAINTS
@@ -81,133 +75,29 @@ ALTER TABLE {machine_profile_table}
 ADD CONSTRAINT gold_machine_profile_pk PRIMARY KEY (machine_id)
 """)
 
-# 2. Crear tabla estática de gold_machine_agg_1h con sufijo _1h en columnas
-agg_1h_table = f"{catalog}.{database}.gold_machine_agg_1h_table"
-spark.sql(f"""
-CREATE OR REPLACE TABLE {agg_1h_table} AS
-SELECT 
-    machine_id,
-    line_id,
-    window_end,
-    window_size,
-    total_units AS total_units_1h,
-    defects AS defects_1h,
-    defect_rate AS defect_rate_1h,
-    avg_vibration AS avg_vibration_1h,
-    avg_tool_wear AS avg_tool_wear_1h,
-    avg_temperature AS avg_temperature_1h,
-    avg_solder_thickness AS avg_solder_thickness_1h,
-    avg_alignment_error AS avg_alignment_error_1h,
-    ingestion_timestamp
-FROM {catalog}.{database}.gold_machine_agg_1h
-""")
-
-spark.sql(f"""
-ALTER TABLE {agg_1h_table}
-ALTER COLUMN machine_id SET NOT NULL
-""")
-
-# window_end es temporal, no necesita estar en PRIMARY KEY, solo NOT NULL para PiT join
-spark.sql(f"""
-ALTER TABLE {agg_1h_table}
-ALTER COLUMN window_end SET NOT NULL
-""")
-
-try:
-    spark.sql(f"ALTER TABLE {agg_1h_table} DROP CONSTRAINT gold_machine_agg_1h_pk")
-except:
-    pass
-
-spark.sql(f"""
-ALTER TABLE {agg_1h_table}
-ADD CONSTRAINT gold_machine_agg_1h_pk PRIMARY KEY (machine_id)
-""")
-
-# 3. Crear tabla estática de gold_machine_agg_24h con sufijo _24h en columnas
-agg_24h_table = f"{catalog}.{database}.gold_machine_agg_24h_table"
-spark.sql(f"""
-CREATE OR REPLACE TABLE {agg_24h_table} AS
-SELECT 
-    machine_id,
-    line_id,
-    window_end,
-    window_size,
-    total_units AS total_units_24h,
-    defects AS defects_24h,
-    defect_rate AS defect_rate_24h,
-    avg_vibration AS avg_vibration_24h,
-    avg_tool_wear AS avg_tool_wear_24h,
-    avg_temperature AS avg_temperature_24h,
-    avg_solder_thickness AS avg_solder_thickness_24h,
-    avg_alignment_error AS avg_alignment_error_24h,
-    ingestion_timestamp
-FROM {catalog}.{database}.gold_machine_agg_24h
-""")
-
-spark.sql(f"""
-ALTER TABLE {agg_24h_table}
-ALTER COLUMN machine_id SET NOT NULL
-""")
-
-# window_end es temporal, no necesita estar en PRIMARY KEY, solo NOT NULL para PiT join
-spark.sql(f"""
-ALTER TABLE {agg_24h_table}
-ALTER COLUMN window_end SET NOT NULL
-""")
-
-try:
-    spark.sql(f"ALTER TABLE {agg_24h_table} DROP CONSTRAINT gold_machine_agg_24h_pk")
-except:
-    pass
-
-spark.sql(f"""
-ALTER TABLE {agg_24h_table}
-ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id)
-""")
-
 print("Tablas estáticas creadas y constraints añadidas exitosamente.")
 
 # Definir los FeatureLookup para cada tabla de características (ahora usando tablas estáticas)
-# Especificamos explícitamente las columnas para evitar duplicados
-# Cada agregación tiene sufijos _1h y _24h para diferenciarse
 machine_profile_lookup = FeatureLookup(
     table_name=machine_profile_table,
     feature_names=["machine_type", "installation_date", "machine_age_days", 
                    "nominal_cycle_time_s", "vibration_baseline_mm_s", 
                    "wear_rate_pct_month", "clean_room_class", "line_capacity_units_day"],
-    lookup_key=["machine_id"],
-    timestamp_lookup_key=None  # No es temporal
-)
-agg_1h_lookup = FeatureLookup(
-    table_name=agg_1h_table,
-    feature_names=["total_units_1h", "defects_1h", "defect_rate_1h", "avg_vibration_1h", 
-                   "avg_tool_wear_1h", "avg_temperature_1h", "avg_solder_thickness_1h", 
-                   "avg_alignment_error_1h"],
     lookup_key=["machine_id"]
-    # Sin timestamp_lookup_key: join simple por machine_id
-)
-agg_24h_lookup = FeatureLookup(
-    table_name=agg_24h_table,
-    feature_names=["total_units_24h", "defects_24h", "defect_rate_24h", "avg_vibration_24h", 
-                   "avg_tool_wear_24h", "avg_temperature_24h", "avg_solder_thickness_24h", 
-                   "avg_alignment_error_24h"],
-    lookup_key=["machine_id"]
-    # Sin timestamp_lookup_key: join simple por machine_id
 )
 
 
 # ===============================
-# 2. CREAR TRAINING SET CON JOIN PiT
+# 2. CREAR TRAINING SET
 # ===============================
 
 
-# Crear el training set con join PiT
+# Crear el training set
 training_set = fe.create_training_set(
     df=spark.table(spine_table),
-    feature_lookups=[machine_profile_lookup, agg_1h_lookup, agg_24h_lookup],
+    feature_lookups=[machine_profile_lookup],
     label="is_defective",
-    exclude_columns=["label_available_date"],  # Excluye metadatos no disponibles en inferencia
-    # Si tienes más columnas a excluir, añádelas aquí
+    exclude_columns=["label_available_date"],
 )
 
 # Materializa el DataFrame enriquecido
@@ -220,6 +110,7 @@ print(f"Filas en spine: {spark.table(spine_table).count()}")
 print(f"Filas en training_df: {training_df.count()}")
 
 # Nulos por columna
+import pyspark.sql.functions as F
 nulls = training_df.select([F.count(F.when(F.col(c).isNull(), c)).alias(c) for c in training_df.columns])
 nulls.show(vertical=True, truncate=False)
 
@@ -248,7 +139,7 @@ try:
     spark.sql(f"ALTER TABLE {dst_table} DROP CONSTRAINT gold_inspection_spine_static_pk")
 except Exception as e:
     if "does not exist" in str(e):
-        pass  # No pasa nada si no existe
+        pass
     elif "not found" in str(e):
         pass
     else:

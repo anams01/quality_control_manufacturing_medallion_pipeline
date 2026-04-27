@@ -39,17 +39,35 @@ dst_table = f"{catalog}.{database}.gold_inspection_spine_static"
 # Cargar la tabla streaming y filtrar nulos
 df = spark.table(src_table).filter("unit_id IS NOT NULL")
 
-
 # ===============================
-# 1. GENERACIÓN DEL DATASET DE ENTRENAMIENTO CON JOIN PiT
+# 0.5 ENRIQUECIMIENTO DEL SPINE CON WINDOW_END
 # ===============================
+from pyspark.sql.functions import date_format, col, to_timestamp, unix_timestamp, floor
 from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
+
+# Enriquecer spine con window_end para cada inspección (redondeado a ventanas de 1h y 24h)
+# window_end = timestamp redondeado al techo de cada período
+df_enriched = df.withColumn(
+    "window_end_1h",
+    to_timestamp(
+        floor((unix_timestamp(col("timestamp")) + 3600) / 3600) * 3600
+    )
+).withColumn(
+    "window_end_24h",
+    to_timestamp(
+        floor((unix_timestamp(col("timestamp")) + 86400) / 86400) * 86400
+    )
+)
+
+# Guardar spine enriquecida temporalmente
+spine_enriched_table = f"{catalog}.{database}.gold_inspection_spine_static_enriched"
+df_enriched.write.mode("overwrite").saveAsTable(spine_enriched_table)
 
 # Instancia del cliente de Feature Store
 fe = FeatureEngineeringClient()
 
-# Tabla spine (ya estática y con PK)
-spine_table = dst_table
+# Tabla spine (ahora con window_end enriquecidos)
+spine_table = spine_enriched_table
 
 # ===============================
 # CONVERTIR VISTAS A TABLAS ESTÁTICAS CON CONSTRAINTS
@@ -181,16 +199,16 @@ agg_1h_lookup = FeatureLookup(
     feature_names=["total_units_1h", "defects_1h", "defect_rate_1h", "avg_vibration_1h", 
                    "avg_tool_wear_1h", "avg_temperature_1h", "avg_solder_thickness_1h", 
                    "avg_alignment_error_1h"],
-    lookup_key=["machine_id"],
-    timestamp_lookup_key="timestamp"  # Join temporal
+    lookup_key=["machine_id", "window_end"],  # Composite key: entity + window
+    timestamp_lookup_key=None  # No necesitamos lookup temporal, la ventana ya está computada
 )
 agg_24h_lookup = FeatureLookup(
     table_name=agg_24h_table,
     feature_names=["total_units_24h", "defects_24h", "defect_rate_24h", "avg_vibration_24h", 
                    "avg_tool_wear_24h", "avg_temperature_24h", "avg_solder_thickness_24h", 
                    "avg_alignment_error_24h"],
-    lookup_key=["machine_id"],
-    timestamp_lookup_key="timestamp"
+    lookup_key=["machine_id", "window_end"],  # Composite key: entity + window
+    timestamp_lookup_key=None  # No necesitamos lookup temporal, la ventana ya está computada
 )
 
 

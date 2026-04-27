@@ -103,6 +103,20 @@ final_table = f"{catalog}.{database}.gold_inspection_training_dataset"
 training_df.write.mode("overwrite").format("delta").saveAsTable(final_table)
 
 # Puedes añadir aquí la escritura de metadatos de trazabilidad si lo deseas
+spark.sql("""
+ALTER TABLE workspace.ana_martin17.gold_machine_profile
+ADD CONSTRAINT gold_machine_profile_pk PRIMARY KEY (machine_id)
+""")
+
+spark.sql("""
+ALTER TABLE workspace.ana_martin17.gold_machine_agg_1h
+ADD CONSTRAINT gold_machine_agg_1h_pk PRIMARY KEY (machine_id, window_end)
+""")
+
+spark.sql("""
+ALTER TABLE workspace.ana_martin17.gold_machine_agg_24h
+ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id, window_end)
+""")
 
 # Asegura que unit_id es NOT NULL y añade la clave primaria (solo si no existe)
 spark.sql(f"""

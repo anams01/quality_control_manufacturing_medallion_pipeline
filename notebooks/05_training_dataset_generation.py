@@ -51,21 +51,97 @@ fe = FeatureEngineeringClient()
 # Tabla spine (ya estática y con PK)
 spine_table = dst_table
 
-# Definir los FeatureLookup para cada tabla de características
+# ===============================
+# CONVERTIR VISTAS A TABLAS ESTÁTICAS CON CONSTRAINTS
+# ===============================
+# Las tablas de características son vistas y no pueden tener constraints.
+# Convertimos cada vista a tabla estática.
+
+# 1. Crear tabla estática de gold_machine_profile
+machine_profile_table = f"{catalog}.{database}.gold_machine_profile_table"
+spark.sql(f"""
+CREATE OR REPLACE TABLE {machine_profile_table} AS
+SELECT * FROM {catalog}.{database}.gold_machine_profile
+""")
+
+# Asegurar que machine_id es NOT NULL
+spark.sql(f"""
+ALTER TABLE {machine_profile_table}
+ALTER COLUMN machine_id SET NOT NULL
+""")
+
+# Eliminar constraint si existe y crear nueva
+try:
+    spark.sql(f"ALTER TABLE {machine_profile_table} DROP CONSTRAINT gold_machine_profile_pk")
+except:
+    pass
+
+spark.sql(f"""
+ALTER TABLE {machine_profile_table}
+ADD CONSTRAINT gold_machine_profile_pk PRIMARY KEY (machine_id)
+""")
+
+# 2. Crear tabla estática de gold_machine_agg_1h
+agg_1h_table = f"{catalog}.{database}.gold_machine_agg_1h_table"
+spark.sql(f"""
+CREATE OR REPLACE TABLE {agg_1h_table} AS
+SELECT * FROM {catalog}.{database}.gold_machine_agg_1h
+""")
+
+spark.sql(f"""
+ALTER TABLE {agg_1h_table}
+ALTER COLUMN machine_id SET NOT NULL
+""")
+
+try:
+    spark.sql(f"ALTER TABLE {agg_1h_table} DROP CONSTRAINT gold_machine_agg_1h_pk")
+except:
+    pass
+
+spark.sql(f"""
+ALTER TABLE {agg_1h_table}
+ADD CONSTRAINT gold_machine_agg_1h_pk PRIMARY KEY (machine_id, window_end)
+""")
+
+# 3. Crear tabla estática de gold_machine_agg_24h
+agg_24h_table = f"{catalog}.{database}.gold_machine_agg_24h_table"
+spark.sql(f"""
+CREATE OR REPLACE TABLE {agg_24h_table} AS
+SELECT * FROM {catalog}.{database}.gold_machine_agg_24h
+""")
+
+spark.sql(f"""
+ALTER TABLE {agg_24h_table}
+ALTER COLUMN machine_id SET NOT NULL
+""")
+
+try:
+    spark.sql(f"ALTER TABLE {agg_24h_table} DROP CONSTRAINT gold_machine_agg_24h_pk")
+except:
+    pass
+
+spark.sql(f"""
+ALTER TABLE {agg_24h_table}
+ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id, window_end)
+""")
+
+print("Tablas estáticas creadas y constraints añadidas exitosamente.")
+
+# Definir los FeatureLookup para cada tabla de características (ahora usando tablas estáticas)
 machine_profile_lookup = FeatureLookup(
-    table_name=f"{catalog}.{database}.gold_machine_profile",
+    table_name=machine_profile_table,
     feature_names=None,  # Todas las columnas excepto la PK
     lookup_key=["machine_id"],
     timestamp_lookup_key=None  # No es temporal
 )
 agg_1h_lookup = FeatureLookup(
-    table_name=f"{catalog}.{database}.gold_machine_agg_1h",
+    table_name=agg_1h_table,
     feature_names=None,
     lookup_key=["machine_id"],
     timestamp_lookup_key="timestamp"  # Join temporal
 )
 agg_24h_lookup = FeatureLookup(
-    table_name=f"{catalog}.{database}.gold_machine_agg_24h",
+    table_name=agg_24h_table,
     feature_names=None,
     lookup_key=["machine_id"],
     timestamp_lookup_key="timestamp"
@@ -73,23 +149,8 @@ agg_24h_lookup = FeatureLookup(
 
 
 # ===============================
-# 2. COMPROBACIONES de spark
+# 2. CREAR TRAINING SET CON JOIN PiT
 # ===============================
-
-spark.sql("""
-ALTER TABLE workspace.ana_martin17.gold_machine_profile
-ADD CONSTRAINT gold_machine_profile_pk PRIMARY KEY (machine_id)
-""")
-
-spark.sql("""
-ALTER TABLE workspace.ana_martin17.gold_machine_agg_1h
-ADD CONSTRAINT gold_machine_agg_1h_pk PRIMARY KEY (machine_id, window_end)
-""")
-
-spark.sql("""
-ALTER TABLE workspace.ana_martin17.gold_machine_agg_24h
-ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id, window_end)
-""")
 
 
 # Crear el training set con join PiT

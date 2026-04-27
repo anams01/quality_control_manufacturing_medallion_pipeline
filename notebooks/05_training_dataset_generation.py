@@ -81,11 +81,25 @@ ALTER TABLE {machine_profile_table}
 ADD CONSTRAINT gold_machine_profile_pk PRIMARY KEY (machine_id)
 """)
 
-# 2. Crear tabla estática de gold_machine_agg_1h
+# 2. Crear tabla estática de gold_machine_agg_1h con sufijo _1h en columnas
 agg_1h_table = f"{catalog}.{database}.gold_machine_agg_1h_table"
 spark.sql(f"""
 CREATE OR REPLACE TABLE {agg_1h_table} AS
-SELECT * FROM {catalog}.{database}.gold_machine_agg_1h
+SELECT 
+    machine_id,
+    line_id,
+    window_end,
+    window_size,
+    total_units AS total_units_1h,
+    defects AS defects_1h,
+    defect_rate AS defect_rate_1h,
+    avg_vibration AS avg_vibration_1h,
+    avg_tool_wear AS avg_tool_wear_1h,
+    avg_temperature AS avg_temperature_1h,
+    avg_solder_thickness AS avg_solder_thickness_1h,
+    avg_alignment_error AS avg_alignment_error_1h,
+    ingestion_timestamp
+FROM {catalog}.{database}.gold_machine_agg_1h
 """)
 
 spark.sql(f"""
@@ -108,11 +122,25 @@ ALTER TABLE {agg_1h_table}
 ADD CONSTRAINT gold_machine_agg_1h_pk PRIMARY KEY (machine_id, window_end)
 """)
 
-# 3. Crear tabla estática de gold_machine_agg_24h
+# 3. Crear tabla estática de gold_machine_agg_24h con sufijo _24h en columnas
 agg_24h_table = f"{catalog}.{database}.gold_machine_agg_24h_table"
 spark.sql(f"""
 CREATE OR REPLACE TABLE {agg_24h_table} AS
-SELECT * FROM {catalog}.{database}.gold_machine_agg_24h
+SELECT 
+    machine_id,
+    line_id,
+    window_end,
+    window_size,
+    total_units AS total_units_24h,
+    defects AS defects_24h,
+    defect_rate AS defect_rate_24h,
+    avg_vibration AS avg_vibration_24h,
+    avg_tool_wear AS avg_tool_wear_24h,
+    avg_temperature AS avg_temperature_24h,
+    avg_solder_thickness AS avg_solder_thickness_24h,
+    avg_alignment_error AS avg_alignment_error_24h,
+    ingestion_timestamp
+FROM {catalog}.{database}.gold_machine_agg_24h
 """)
 
 spark.sql(f"""
@@ -139,6 +167,7 @@ print("Tablas estáticas creadas y constraints añadidas exitosamente.")
 
 # Definir los FeatureLookup para cada tabla de características (ahora usando tablas estáticas)
 # Especificamos explícitamente las columnas para evitar duplicados
+# Cada agregación tiene sufijos _1h y _24h para diferenciarse
 machine_profile_lookup = FeatureLookup(
     table_name=machine_profile_table,
     feature_names=["machine_type", "installation_date", "machine_age_days", 
@@ -149,17 +178,17 @@ machine_profile_lookup = FeatureLookup(
 )
 agg_1h_lookup = FeatureLookup(
     table_name=agg_1h_table,
-    feature_names=["total_units", "defects", "defect_rate", "avg_vibration", 
-                   "avg_tool_wear", "avg_temperature", "avg_solder_thickness", 
-                   "avg_alignment_error"],
+    feature_names=["total_units_1h", "defects_1h", "defect_rate_1h", "avg_vibration_1h", 
+                   "avg_tool_wear_1h", "avg_temperature_1h", "avg_solder_thickness_1h", 
+                   "avg_alignment_error_1h"],
     lookup_key=["machine_id"],
     timestamp_lookup_key="timestamp"  # Join temporal
 )
 agg_24h_lookup = FeatureLookup(
     table_name=agg_24h_table,
-    feature_names=["total_units", "defects", "defect_rate", "avg_vibration", 
-                   "avg_tool_wear", "avg_temperature", "avg_solder_thickness", 
-                   "avg_alignment_error"],
+    feature_names=["total_units_24h", "defects_24h", "defect_rate_24h", "avg_vibration_24h", 
+                   "avg_tool_wear_24h", "avg_temperature_24h", "avg_solder_thickness_24h", 
+                   "avg_alignment_error_24h"],
     lookup_key=["machine_id"],
     timestamp_lookup_key="timestamp"
 )

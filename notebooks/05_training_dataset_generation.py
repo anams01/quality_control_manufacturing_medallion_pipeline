@@ -138,21 +138,28 @@ ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id, window_end)
 print("Tablas estáticas creadas y constraints añadidas exitosamente.")
 
 # Definir los FeatureLookup para cada tabla de características (ahora usando tablas estáticas)
+# Especificamos explícitamente las columnas para evitar duplicados
 machine_profile_lookup = FeatureLookup(
     table_name=machine_profile_table,
-    feature_names=None,  # Todas las columnas excepto la PK
+    feature_names=["machine_type", "installation_date", "machine_age_days", 
+                   "nominal_cycle_time_s", "vibration_baseline_mm_s", 
+                   "wear_rate_pct_month", "clean_room_class", "line_capacity_units_day"],
     lookup_key=["machine_id"],
     timestamp_lookup_key=None  # No es temporal
 )
 agg_1h_lookup = FeatureLookup(
     table_name=agg_1h_table,
-    feature_names=None,
+    feature_names=["total_units", "defects", "defect_rate", "avg_vibration", 
+                   "avg_tool_wear", "avg_temperature", "avg_solder_thickness", 
+                   "avg_alignment_error"],
     lookup_key=["machine_id"],
     timestamp_lookup_key="timestamp"  # Join temporal
 )
 agg_24h_lookup = FeatureLookup(
     table_name=agg_24h_table,
-    feature_names=None,
+    feature_names=["total_units", "defects", "defect_rate", "avg_vibration", 
+                   "avg_tool_wear", "avg_temperature", "avg_solder_thickness", 
+                   "avg_alignment_error"],
     lookup_key=["machine_id"],
     timestamp_lookup_key="timestamp"
 )

@@ -231,13 +231,142 @@ feature_lookups = [
 
 # COMMAND ----------
 
+# Create static copies of feature tables with primary keys
+# (Materialized views and streaming tables cannot have PK constraints)
+catalog = "workspace"
+database = "ana_martin17"
+
+# 1. Create static copy of gold_machine_profile (exclude line_id and ingestion_timestamp)
+machine_profile_static = f"{catalog}.{database}.gold_machine_profile_static"
+spark.sql(f"""
+CREATE OR REPLACE TABLE {machine_profile_static} AS
+SELECT 
+    machine_id,
+    machine_type,
+    installation_date,
+    machine_age_days,
+    nominal_cycle_time_s,
+    vibration_baseline_mm_s,
+    wear_rate_pct_month,
+    clean_room_class,
+    line_capacity_units_day
+FROM {catalog}.{database}.gold_machine_profile
+""")
+spark.sql(f"ALTER TABLE {machine_profile_static} ALTER COLUMN machine_id SET NOT NULL")
+try:
+    spark.sql(f"ALTER TABLE {machine_profile_static} DROP CONSTRAINT gold_machine_profile_static_pk")
+except:
+    pass
+spark.sql(f"ALTER TABLE {machine_profile_static} ADD CONSTRAINT gold_machine_profile_static_pk PRIMARY KEY (machine_id)")
+
+# 2. Create static copy of gold_supplier_profile (exclude ingestion_timestamp to avoid duplicates)
+supplier_profile_static = f"{catalog}.{database}.gold_supplier_profile_static"
+spark.sql(f"""
+CREATE OR REPLACE TABLE {supplier_profile_static} AS
+SELECT 
+    supplier_id,
+    supplier_name,
+    country,
+    onboarding_date,
+    solder_thickness_mean_um,
+    quality_rating,
+    is_new_supplier
+FROM {catalog}.{database}.gold_supplier_profile
+""")
+spark.sql(f"ALTER TABLE {supplier_profile_static} ALTER COLUMN supplier_id SET NOT NULL")
+try:
+    spark.sql(f"ALTER TABLE {supplier_profile_static} DROP CONSTRAINT gold_supplier_profile_static_pk")
+except:
+    pass
+spark.sql(f"ALTER TABLE {supplier_profile_static} ADD CONSTRAINT gold_supplier_profile_static_pk PRIMARY KEY (supplier_id)")
+
+# 3. Create static copy of gold_machine_agg_1h (PK only on machine_id for PIT joins, keep window_end for matching)
+machine_agg_1h_static = f"{catalog}.{database}.gold_machine_agg_1h_static"
+spark.sql(f"""
+CREATE OR REPLACE TABLE {machine_agg_1h_static} AS
+SELECT 
+    machine_id,
+    window_end,
+    window_size AS window_size_1h,
+    total_units AS total_units_1h,
+    defects AS defects_1h,
+    defect_rate AS defect_rate_1h,
+    avg_vibration AS avg_vibration_1h,
+    avg_tool_wear AS avg_tool_wear_1h,
+    avg_temperature AS avg_temperature_1h,
+    avg_solder_thickness AS avg_solder_thickness_1h,
+    avg_alignment_error AS avg_alignment_error_1h
+FROM {catalog}.{database}.gold_machine_agg_1h
+""")
+spark.sql(f"ALTER TABLE {machine_agg_1h_static} ALTER COLUMN machine_id SET NOT NULL")
+try:
+    spark.sql(f"ALTER TABLE {machine_agg_1h_static} DROP CONSTRAINT gold_machine_agg_1h_static_pk")
+except:
+    pass
+spark.sql(f"ALTER TABLE {machine_agg_1h_static} ADD CONSTRAINT gold_machine_agg_1h_static_pk PRIMARY KEY (machine_id)")
+
+# 4. For 24h, exclude window_end to avoid duplicate (only need one window_end column from 1h table)
+machine_agg_24h_static = f"{catalog}.{database}.gold_machine_agg_24h_static"
+spark.sql(f"""
+CREATE OR REPLACE TABLE {machine_agg_24h_static} AS
+SELECT 
+    machine_id,
+    window_size AS window_size_24h,
+    total_units AS total_units_24h,
+    defects AS defects_24h,
+    defect_rate AS defect_rate_24h,
+    avg_vibration AS avg_vibration_24h,
+    avg_tool_wear AS avg_tool_wear_24h,
+    avg_temperature AS avg_temperature_24h,
+    avg_solder_thickness AS avg_solder_thickness_24h,
+    avg_alignment_error AS avg_alignment_error_24h
+FROM {catalog}.{database}.gold_machine_agg_24h
+""")
+spark.sql(f"ALTER TABLE {machine_agg_24h_static} ALTER COLUMN machine_id SET NOT NULL")
+try:
+    spark.sql(f"ALTER TABLE {machine_agg_24h_static} DROP CONSTRAINT gold_machine_agg_24h_static_pk")
+except:
+    pass
+spark.sql(f"ALTER TABLE {machine_agg_24h_static} ADD CONSTRAINT gold_machine_agg_24h_static_pk PRIMARY KEY (machine_id)")
+
+print("Static feature tables with primary keys created successfully.")
+
+# Update feature lookups to use static tables
+machine_profile_lookups = FeatureLookup(
+    table_name=machine_profile_static,
+    lookup_key="machine_id"
+)
+
+supplier_profile_lookups = FeatureLookup(
+    table_name=supplier_profile_static,
+    lookup_key="supplier_id"
+)
+
+machine_agg_1h_lookups = FeatureLookup(
+    table_name=machine_agg_1h_static,
+    lookup_key="machine_id"
+)
+
+machine_agg_24h_lookups = FeatureLookup(
+    table_name=machine_agg_24h_static,
+    lookup_key="machine_id"
+)
+
+feature_lookups_static = [
+    machine_profile_lookups,
+    supplier_profile_lookups,
+    machine_agg_1h_lookups,
+    machine_agg_24h_lookups
+]
+
+# Now create the training set
 label = "is_defective"
 exclude_columns = ["label_available_date"]
 
 # Plan lógico
 training_dataset = fe.create_training_set(
     df=spine_df,
-    feature_lookups=feature_lookups,
+    feature_lookups=feature_lookups_static,
     label=label,
     exclude_columns=exclude_columns
 )
@@ -245,8 +374,8 @@ training_dataset = fe.create_training_set(
 # Materialización (Ejecución real de los Joins distribuidos)
 training_df = training_dataset.load_df()
 
-print(f"Training dataset rows: {training_df.count():,}")
 print(f"Training dataset columns: {len(training_df.columns)}")
+print("Training dataset created successfully.")
 
 # COMMAND ----------
 
@@ -255,16 +384,23 @@ print(f"Training dataset columns: {len(training_df.columns)}")
 
 # COMMAND ----------
 
-training_count = training_df.count()
+# DBTITLE 1,Untitled
+from pyspark.sql import Window
+from pyspark.sql.functions import sum as spark_sum
 
+# Compute class balance directly without full count
 print("Class balance (Defects):")
-class_balance_rows = (
+class_balance_df = (
     training_df.groupBy(label)
                .count()
-               .withColumn("pct", round(col("count") / training_count * 100, 2))
-               .orderBy(label).collect()
+               .withColumn("pct", round(col("count") / spark_sum("count").over(Window.partitionBy()) * 100, 2))
+               .orderBy(label)
 )
 
+class_balance_rows = class_balance_df.collect()
+total_count = sum(row['count'] for row in class_balance_rows)
+
+print(f"Total rows: {total_count:,}\n")
 for row in class_balance_rows:
     print(f"Defect {row[label]}: {row['count']:,} rows ({row['pct']}%)")
 

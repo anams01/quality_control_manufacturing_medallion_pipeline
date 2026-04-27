@@ -29,6 +29,7 @@
 from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
 from datetime import datetime, timezone
 from pyspark.sql.functions import col, count, max, round, when
+import pyspark.sql.functions as F
 
 # === BLOQUE PARA CREAR TABLA ESTÁTICA LISTA PARA FEATURE STORE ===
 catalog = "workspace"
@@ -39,34 +40,15 @@ dst_table = f"{catalog}.{database}.gold_inspection_spine_static"
 # Cargar la tabla streaming y filtrar nulos
 df = spark.table(src_table).filter("unit_id IS NOT NULL")
 
-# ===============================
-# 0.5 ENRIQUECIMIENTO DEL SPINE CON WINDOW_END
-# ===============================
-from pyspark.sql.functions import date_format, col, to_timestamp, unix_timestamp, floor
-from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
-
-# Enriquecer spine con window_end para cada inspección (redondeado a ventanas de 1h y 24h)
-# window_end = timestamp redondeado al techo de cada período
-df_enriched = df.withColumn(
-    "window_end_1h",
-    to_timestamp(
-        floor((unix_timestamp(col("timestamp")) + 3600) / 3600) * 3600
-    )
-).withColumn(
-    "window_end_24h",
-    to_timestamp(
-        floor((unix_timestamp(col("timestamp")) + 86400) / 86400) * 86400
-    )
-)
-
-# Guardar spine enriquecida temporalmente
+# Guardar spine como tabla estática (ya filtrada y lista para Feature Store)
 spine_enriched_table = f"{catalog}.{database}.gold_inspection_spine_static_enriched"
-df_enriched.write.mode("overwrite").saveAsTable(spine_enriched_table)
+df.write.mode("overwrite").saveAsTable(spine_enriched_table)
 
 # Instancia del cliente de Feature Store
+from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
 fe = FeatureEngineeringClient()
 
-# Tabla spine (ahora con window_end enriquecidos)
+# Tabla spine (con timestamp para point-in-time joins)
 spine_table = spine_enriched_table
 
 # ===============================
@@ -125,6 +107,7 @@ ALTER TABLE {agg_1h_table}
 ALTER COLUMN machine_id SET NOT NULL
 """)
 
+# window_end es temporal, no necesita estar en PRIMARY KEY, solo NOT NULL para PiT join
 spark.sql(f"""
 ALTER TABLE {agg_1h_table}
 ALTER COLUMN window_end SET NOT NULL
@@ -137,7 +120,7 @@ except:
 
 spark.sql(f"""
 ALTER TABLE {agg_1h_table}
-ADD CONSTRAINT gold_machine_agg_1h_pk PRIMARY KEY (machine_id, window_end)
+ADD CONSTRAINT gold_machine_agg_1h_pk PRIMARY KEY (machine_id)
 """)
 
 # 3. Crear tabla estática de gold_machine_agg_24h con sufijo _24h en columnas
@@ -166,6 +149,7 @@ ALTER TABLE {agg_24h_table}
 ALTER COLUMN machine_id SET NOT NULL
 """)
 
+# window_end es temporal, no necesita estar en PRIMARY KEY, solo NOT NULL para PiT join
 spark.sql(f"""
 ALTER TABLE {agg_24h_table}
 ALTER COLUMN window_end SET NOT NULL
@@ -178,7 +162,7 @@ except:
 
 spark.sql(f"""
 ALTER TABLE {agg_24h_table}
-ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id, window_end)
+ADD CONSTRAINT gold_machine_agg_24h_pk PRIMARY KEY (machine_id)
 """)
 
 print("Tablas estáticas creadas y constraints añadidas exitosamente.")
@@ -199,16 +183,16 @@ agg_1h_lookup = FeatureLookup(
     feature_names=["total_units_1h", "defects_1h", "defect_rate_1h", "avg_vibration_1h", 
                    "avg_tool_wear_1h", "avg_temperature_1h", "avg_solder_thickness_1h", 
                    "avg_alignment_error_1h"],
-    lookup_key=["machine_id", "window_end"],  # Composite key: entity + window
-    timestamp_lookup_key=None  # No necesitamos lookup temporal, la ventana ya está computada
+    lookup_key=["machine_id"]
+    # Sin timestamp_lookup_key: join simple por machine_id
 )
 agg_24h_lookup = FeatureLookup(
     table_name=agg_24h_table,
     feature_names=["total_units_24h", "defects_24h", "defect_rate_24h", "avg_vibration_24h", 
                    "avg_tool_wear_24h", "avg_temperature_24h", "avg_solder_thickness_24h", 
                    "avg_alignment_error_24h"],
-    lookup_key=["machine_id", "window_end"],  # Composite key: entity + window
-    timestamp_lookup_key=None  # No necesitamos lookup temporal, la ventana ya está computada
+    lookup_key=["machine_id"]
+    # Sin timestamp_lookup_key: join simple por machine_id
 )
 
 

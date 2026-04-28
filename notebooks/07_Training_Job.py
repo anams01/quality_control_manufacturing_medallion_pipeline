@@ -222,6 +222,8 @@ def apply_string_indexing(df, categorical_cols):
     Convert categorical string columns to integer indices using DataFrame operations.
     Returns (df_indexed, index_mappings) where index_mappings is a dict of column->mapping.
     """
+    from pyspark.sql.functions import when, lit, col
+    
     index_mappings = {}
     df_result = df
     
@@ -231,12 +233,12 @@ def apply_string_indexing(df, categorical_cols):
         value_to_idx = {v: i for i, v in enumerate(sorted(unique_vals))}
         
         # Build when/otherwise chain for mapping (native Spark)
-        when_chain = when(col(col_name).isNull(), lit(float(len(value_to_idx))))
+        indexed_expr = when(col(col_name).isNull(), lit(float(len(value_to_idx))))
         for val, idx in value_to_idx.items():
-            when_chain = when_chain.when(col(col_name) == lit(val), lit(float(idx)))
-        indexed_col = when_chain.otherwise(lit(float(len(value_to_idx))))
+            indexed_expr = indexed_expr.when(col(col_name) == lit(val), lit(float(idx)))
+        indexed_expr = indexed_expr.otherwise(lit(float(len(value_to_idx))))
         
-        df_result = df_result.withColumn(f"{col_name}_idx", indexed_col)
+        df_result = df_result.withColumn(f"{col_name}_idx", indexed_expr)
         index_mappings[col_name] = value_to_idx
     
     return df_result, index_mappings
@@ -419,6 +421,9 @@ print("=" * 80)
 print("APPLYING PRE-PIPELINE PREPROCESSING (No MLlib Transformers)")
 print("=" * 80)
 
+# Reimport functions needed for this section (ensure availability in Spark Connect)
+from pyspark.sql.functions import col, when, lit
+
 # Start with renamed data (numeric columns have _imp suffix)
 df_preprocessed = train_renamed
 
@@ -437,17 +442,20 @@ for cat_col in categorical_columns:
     category_max_indices[cat_col] = len(mapping_dict)  # Max index for unknown values
     
     # Build chain of when/otherwise for mapping (native Spark, no UDF needed)
+    # Import functions fresh to avoid scope issues
+    from pyspark.sql.functions import when, lit, col
+    
     # Start with: if value is None, return len(mapping_dict) (unknown value)
-    when_chain = when(col(cat_col).isNull(), lit(float(len(mapping_dict))))
+    indexed_expr = when(col(cat_col).isNull(), lit(float(len(mapping_dict))))
     
     # Add condition for each known value
     for val, idx in mapping_dict.items():
-        when_chain = when_chain.when(col(cat_col) == lit(val), lit(float(idx)))
+        indexed_expr = indexed_expr.when(col(cat_col) == lit(val), lit(float(idx)))
     
     # Final otherwise: unknown categorical value -> assign to last index
-    indexed_col = when_chain.otherwise(lit(float(len(mapping_dict))))
+    indexed_expr = indexed_expr.otherwise(lit(float(len(mapping_dict))))
     
-    df_preprocessed = df_preprocessed.withColumn(f"{cat_col}_idx", indexed_col)
+    df_preprocessed = df_preprocessed.withColumn(f"{cat_col}_idx", indexed_expr)
     print(f"   - {cat_col}: {len(mapping_dict)} categories → indexed")
 
 # Step 2: One-Hot Encoding

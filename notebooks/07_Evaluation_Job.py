@@ -99,15 +99,45 @@ print(dataset_description)
 # MAGIC
 # MAGIC ## 4. Carga del modelo y evaluación
 # MAGIC
-# MAGIC Se carga el `PipelineModel` desde el almacén de artefactos de `MLflow` usando la `URI` recibida por *widget*. A continuación, se aplica sobre la partición seleccionada por `evaluation_dataset` para calcular las métricas de rendimiento correspondientes a esta fase del ciclo de vida.
+# MAGIC Se carga el modelo sklearn desde joblib (en lugar de MLflow Spark).
+# MAGIC A continuación, se aplica sobre la partición seleccionada para calcular las métricas.
 
 # COMMAND ----------
 
-pipeline_model = mlflow.spark.load_model(model_artifact_uri)
-lr_fitted = pipeline_model.stages[-1]
+import joblib
+import numpy as np
 
-eval_predictions = pipeline_model.transform(eval_df)
-eval_metrics = compute_metrics(eval_predictions)
+# Load sklearn model from joblib
+model_file_path = model_artifact_uri.replace("dbfs:", "/dbfs")
+if model_file_path.endswith("/"):
+    model_file_path = model_file_path + "sklearn_model.pkl"
+elif not model_file_path.endswith(".pkl"):
+    model_file_path = model_file_path + "/sklearn_model.pkl"
+
+pipeline_model = joblib.load(model_file_path)
+print(f"Model loaded from: {model_file_path}")
+
+# Convert eval_df to pandas and extract features
+eval_pandas_df = eval_df.select([features_column, label_column]).toPandas()
+
+# Extract features and labels
+X_eval = eval_pandas_df[features_column].apply(lambda x: np.array(x) if isinstance(x, list) else x).values
+X_eval = np.array([np.array(xi, dtype=float) if hasattr(xi, '__iter__') else [float(xi)] for xi in X_eval])
+y_eval = eval_pandas_df[label_column].values
+
+# Get predictions from sklearn model
+y_pred_proba = pipeline_model.predict_proba(X_eval)  # [[prob_0, prob_1], ...]
+y_pred = pipeline_model.predict(X_eval)
+p_eval = y_pred_proba[:, 1]  # Probability of defect (class 1)
+
+# Create predictions dataframe in format expected by compute_metrics and visualizations
+predictions_df = pd.DataFrame({
+    label_column: y_eval,
+    prob_defective_column: p_eval,
+    prediction_column: y_pred
+})
+
+eval_metrics = compute_metrics(predictions_df)
 
 print(f"AUC-PR: {eval_metrics['auc_pr']:.4f}")
 print(f"AUC-ROC: {eval_metrics['auc_roc']:.4f}")
@@ -120,19 +150,12 @@ print(f"Accuracy: {eval_metrics['accuracy']:.4f}")
 
 # MAGIC %md
 # MAGIC
-# MAGIC ## 5. Conversión a `pandas` y umbral de decisión óptimo
+# MAGIC ## 5. Umbral de decisión óptimo
 # MAGIC
-# MAGIC Se convierte el resultado de la evaluación a `pandas` para poder calcular el umbral de decisión óptimo mediante `find_best_threshold`. Este umbral es el valor de corte sobre la probabilidad estimada de fraude que maximiza el *F1-score* sobre la partición evaluada.
-# MAGIC
-# MAGIC En la fase de experimentación, este valor se calcula sobre el conjunto de validación y se registra como referencia para la comparación `champion` contra `challenger`. En la fase de producción, se reporta sobre el conjunto de prueba con carácter meramente informativo (el umbral operativo del modelo es siempre el que se optimizó sobre validación).
+# MAGIC Se calcula el umbral de decisión óptimo mediante `find_best_threshold`. 
+# MAGIC Este umbral es el valor de corte sobre la probabilidad que maximiza el F1-score.
 
 # COMMAND ----------
-
-eval_pandas_df = to_pandas_predictions(eval_predictions)
-
-y_eval = eval_pandas_df[label_column].values
-p_eval = eval_pandas_df[prob_defective_column].values
-pred_eval = eval_pandas_df[prediction_column].values
 
 best_threshold, best_f1_score = find_best_threshold(y_eval, p_eval)
 
@@ -164,7 +187,7 @@ save_diagnostic_figure(
     "roc_curve.png"
 )
 save_diagnostic_figure(
-    fig_confusion_matrix(y_eval, pred_eval, f"Confusion matrix — {evaluation_tag} ({evaluation_dataset})"),
+    fig_confusion_matrix(y_eval, y_pred, f"Confusion matrix — {evaluation_tag} ({evaluation_dataset})"),
     figures_local_path,
     "confusion_matrix.png"
 )
@@ -196,7 +219,7 @@ target_names = ["Good", "Defective"]
 report_path = str(Path(eval_tmp_path) / "classification_report.txt")
 
 with open(report_path, "w") as fh:
-    fh.write(classification_report(y_eval, pred_eval, target_names = target_names))
+    fh.write(classification_report(y_eval, y_pred, target_names = target_names))
 
 print(f"Classification report successfully saved to {report_path}")
 

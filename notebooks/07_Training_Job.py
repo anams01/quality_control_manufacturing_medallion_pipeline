@@ -230,16 +230,13 @@ def apply_string_indexing(df, categorical_cols):
         unique_vals = [row[0] for row in df_result.select(col_name).distinct().collect() if row[0] is not None]
         value_to_idx = {v: i for i, v in enumerate(sorted(unique_vals))}
         
-        # Apply mapping via UDF with closure (no broadcast needed)
-        num_cats = len(value_to_idx)
+        # Build when/otherwise chain for mapping (native Spark)
+        when_chain = when(col(col_name).isNull(), lit(float(len(value_to_idx))))
+        for val, idx in value_to_idx.items():
+            when_chain = when_chain.when(col(col_name) == lit(val), lit(float(idx)))
+        indexed_col = when_chain.otherwise(lit(float(len(value_to_idx))))
         
-        @udf(DoubleType())
-        def string_to_index(val, mapping=value_to_idx, num_categories=num_cats):
-            if val is None:
-                return float(num_categories)  # Unknown value
-            return float(mapping.get(val, num_categories))
-        
-        df_result = df_result.withColumn(f"{col_name}_idx", string_to_index(col(col_name)))
+        df_result = df_result.withColumn(f"{col_name}_idx", indexed_col)
         index_mappings[col_name] = value_to_idx
     
     return df_result, index_mappings
@@ -437,33 +434,35 @@ for cat_col in categorical_columns:
     # Create mapping dict for indexing
     mapping_dict = {v: float(i) for i, v in enumerate(sorted(unique_vals))}
     categorical_mappings[cat_col] = mapping_dict
-    category_max_indices[cat_col] = len(mapping_dict) - 1  # For one-hot encoding
+    category_max_indices[cat_col] = len(mapping_dict)  # Max index for unknown values
     
-    # Create UDF that captures mapping_dict in closure (no broadcast needed for Spark Connect)
-    num_categories = len(mapping_dict)
+    # Build chain of when/otherwise for mapping (native Spark, no UDF needed)
+    # Start with: if value is None, return len(mapping_dict) (unknown value)
+    when_chain = when(col(cat_col).isNull(), lit(float(len(mapping_dict))))
     
-    @udf(DoubleType())
-    def index_func(val, mapping=mapping_dict, num_cats=num_categories):
-        if val is None:
-            return float(num_cats)  # Unknown/null value
-        return float(mapping.get(val, num_cats))
+    # Add condition for each known value
+    for val, idx in mapping_dict.items():
+        when_chain = when_chain.when(col(cat_col) == lit(val), lit(float(idx)))
     
-    df_preprocessed = df_preprocessed.withColumn(f"{cat_col}_idx", index_func(col(cat_col)))
+    # Final otherwise: unknown categorical value -> assign to last index
+    indexed_col = when_chain.otherwise(lit(float(len(mapping_dict))))
+    
+    df_preprocessed = df_preprocessed.withColumn(f"{cat_col}_idx", indexed_col)
     print(f"   - {cat_col}: {len(mapping_dict)} categories → indexed")
 
 # Step 2: One-Hot Encoding
 print("\n2. One-Hot Encoding indexed columns...")
 for cat_col in categorical_columns:
     idx_col = f"{cat_col}_idx"
-    max_idx_val = category_max_indices[cat_col]
+    max_idx_val = category_max_indices[cat_col]  # Number of categories
     
     # Create one-hot columns (drop last to avoid multicollinearity)
-    for i in range(max_idx_val):  # Drop last by default
+    for i in range(max_idx_val - 1):  # Drop last by default
         df_preprocessed = df_preprocessed.withColumn(
             f"{cat_col}_ohe_{i}",
             when(col(idx_col) == lit(i), 1.0).otherwise(0.0)
         )
-    print(f"   - {cat_col}: {max_idx_val} one-hot features created")
+    print(f"   - {cat_col}: {max_idx_val - 1} one-hot features created")
 
 # Step 3: Vector Assembly
 print("\n3. Assembling feature vector...")
@@ -472,7 +471,7 @@ feature_cols_for_assembly = (
     [f"{c}_imp" for c in numeric_columns]  # Imputed numeric
     + boolean_columns  # Boolean columns (as-is)
     + [f"{cat}_ohe_{i}" for cat in categorical_columns 
-       for i in range(category_max_indices[cat])]
+       for i in range(category_max_indices[cat] - 1)]  # One-hot (drop last)
 )
 
 print(f"   Total features before assembly: {len(feature_cols_for_assembly)}")

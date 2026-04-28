@@ -428,14 +428,16 @@ df_preprocessed = train_renamed
 # Step 1: String Indexing for categorical columns
 print("\n1. String Indexing categorical columns...")
 categorical_mappings = {}
+category_max_indices = {}
+
 for cat_col in categorical_columns:
-    # Get unique values and create mapping
-    unique_vals = df_preprocessed.select(cat_col).distinct().rdd.flatMap(lambda x: x).collect()
-    unique_vals = [v for v in unique_vals if v is not None]
+    # Get unique values using DataFrame operations (no RDD - Spark Connect compatible)
+    unique_vals = [row[0] for row in df_preprocessed.select(cat_col).distinct().collect() if row[0] is not None]
     
     # Create UDF for indexing
     mapping_dict = {v: float(i) for i, v in enumerate(sorted(unique_vals))}
     categorical_mappings[cat_col] = mapping_dict
+    category_max_indices[cat_col] = len(mapping_dict) - 1  # For one-hot encoding
     
     mapping_broadcast = spark.broadcast(mapping_dict)
     
@@ -450,7 +452,7 @@ for cat_col in categorical_columns:
 print("\n2. One-Hot Encoding indexed columns...")
 for cat_col in categorical_columns:
     idx_col = f"{cat_col}_idx"
-    max_idx_val = int(df_preprocessed.agg({idx_col: "max"}).collect()[0][0])
+    max_idx_val = category_max_indices[cat_col]
     
     # Create one-hot columns (drop last to avoid multicollinearity)
     for i in range(max_idx_val):  # Drop last by default
@@ -467,7 +469,7 @@ feature_cols_for_assembly = (
     [f"{c}_imp" for c in numeric_columns]  # Imputed numeric
     + boolean_columns  # Boolean columns (as-is)
     + [f"{cat}_ohe_{i}" for cat in categorical_columns 
-       for i in range(int(df_preprocessed.agg({f"{cat}_idx": "max"}).collect()[0][0]))]
+       for i in range(category_max_indices[cat])]
 )
 
 print(f"   Total features before assembly: {len(feature_cols_for_assembly)}")

@@ -15,6 +15,15 @@ Tablas generadas:
 
 import pyspark.pipelines as dp
 from pyspark.sql import functions as F
+import dlt
+from pyspark.sql import Window
+from pyspark.sql.functions import (
+  col,
+  expr,
+  avg,
+  sum as _sum,
+  count
+)
 
 CATALOG       = "workspace"
 SCHEMA_TABLES = "ana_martin17"
@@ -141,3 +150,61 @@ def gold_machine_agg_30d():
             F.current_timestamp().alias("ingestion_timestamp"),
         )
     )
+
+@dlt.table(
+  name="gold_machine_aggregations",
+  comment="""
+    Aggregated machine sensor readings and defect rates over various time windows.
+    This table is a feature view used for point-in-time lookups.
+  """,
+  table_properties={
+    "quality": "gold",
+    "delta.enableChangeDataFeed": "true"
+  }
+)
+def machine_aggregations():
+  """
+  Calculates rolling window aggregations for machine sensor data and defect rates.
+  This approach is highly efficient as it calculates all aggregations in a single pass
+  over the data, avoiding the creation of large, intermediate tables.
+  """
+  
+  inspections_df = dlt.read_stream("silver_inspections")
+
+  # Define the time windows in hours and their string representations
+  windows = {
+    1: "1h",
+    24: "24h",
+    7*24: "7d",
+    30*24: "30d"
+  }
+
+  # Iteratively add aggregated columns for each window
+  agg_df = inspections_df
+  for hours, name in windows.items():
+    window_spec = (
+      Window
+        .partitionBy("machine_id")
+        .orderBy(col("timestamp").cast("long"))
+        .rangeBetween(-hours * 3600, 0) # Window is from X hours ago to current event
+    )
+    
+    # Calculate aggregations over the window
+    agg_df = agg_df.withColumn(f"avg_temperature_{name}", avg("temperature").over(window_spec))
+    agg_df = agg_df.withColumn(f"avg_humidity_{name}", avg("humidity").over(window_spec))
+    agg_df = agg_df.withColumn(f"avg_power_consumption_{name}", avg("power_consumption").over(window_spec))
+    
+    # Calculate defect rate over the window
+    defective_sum = _sum(col("is_defective")).over(window_spec)
+    total_count = count(col("is_defective")).over(window_spec)
+    agg_df = agg_df.withColumn(f"defect_rate_{name}", (defective_sum / total_count) * 100)
+
+  # Select the final columns for the feature table
+  # The primary keys are machine_id and timestamp, which are required for the Feature Store
+  final_columns = [
+    "machine_id",
+    "timestamp",
+    "inspection_id"
+  ] + [f"{agg}_{name}" for name in windows.values() for agg in ["avg_temperature", "avg_humidity", "avg_power_consumption", "defect_rate"]]
+  
+  return agg_df.select(*final_columns)

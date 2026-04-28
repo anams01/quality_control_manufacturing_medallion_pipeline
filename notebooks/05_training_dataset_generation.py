@@ -1,513 +1,153 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC
-# MAGIC # Generación del conjunto de datos de entrenamiento
+# MAGIC # Generación del Conjunto de Datos de Entrenamiento con Feature Store
 # MAGIC
 # MAGIC **Autora**: Ana Martín Serrano
 # MAGIC
-# MAGIC El objetivo de esta libreta es construir el conjunto de datos estático para entrenar nuestro modelo predictivo de **detección de defectos en componentes electrónicos**.
+# MAGIC Este notebook utiliza el Databricks Feature Store para construir el conjunto de datos de entrenamiento. Este enfoque reemplaza los costosos joins manuales por `FeatureLookups` que realizan uniones `point-in-time` de manera automática y eficiente.
 # MAGIC
-# MAGIC Combinaremos la **`gold_inspection_spine`** (donde residen las etiquetas `is_defective` de las inspecciones) con:
-# MAGIC 1. `gold_machine_profile` (perfil estático de máquina)
-# MAGIC 2. `gold_supplier_profile` (perfil estático de proveedor)
-# MAGIC 3. `gold_machine_agg_1h` y `gold_machine_agg_24h` (métricas de degradación)
-# MAGIC 4. Las variables de sensor capturadas en tiempo real se encuentran ya insertadas en la *spine*.
+# MAGIC El proceso es el siguiente:
+# MAGIC 1. Se define una **tabla base (spine)** que contiene los eventos de inspección (`inspection_id`), la marca de tiempo (`timestamp`) y la etiqueta a predecir (`is_defective`).
+# MAGIC 2. Se definen **`FeatureLookups`** que apuntan a nuestras tablas de características en la capa Gold.
+# MAGIC 3. Se invoca a `fe.create_training_set`, que se encarga de unir las características correctas a cada inspección basándose en la marca de tiempo.
+# MAGIC 4. El conjunto de datos resultante se materializa en una tabla Delta final, lista para el entrenamiento del modelo.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Configuración
+# MAGIC ## 1. Configuración e Instalación
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-feature-engineering>=0.13.0
+# MAGIC %pip install databricks-feature-engineering>=0.1.3
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
 
-
 from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
-from datetime import datetime, timezone
-from pyspark.sql.functions import col, count, max, round, when
+from pyspark.sql.functions import col
 
-# === BLOQUE PARA CREAR TABLA ESTÁTICA LISTA PARA FEATURE STORE ===
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2. Definición de Parámetros
+# MAGIC
+# MAGIC Se definen los nombres del catálogo, la base de datos y las tablas que se utilizarán.
+
+# COMMAND ----------
+
 catalog = "workspace"
 database = "ana_martin17"
-src_table = f"{catalog}.{database}.gold_inspection_spine"
-dst_table = f"{catalog}.{database}.gold_inspection_spine_static"
 
-# Cargar la tabla streaming y filtrar nulos
-df = spark.table(src_table).filter("unit_id IS NOT NULL")
+# --- Tablas de Origen (Capa Gold) ---
+spine_table_name = f"{catalog}.{database}.gold_inspection_spine"
+machine_profile_table_name = f"{catalog}.{database}.gold_machine_profile"
+supplier_profile_table_name = f"{catalog}.{database}.gold_supplier_profile"
+machine_aggregations_table_name = f"{catalog}.{database}.gold_machine_aggregations"
 
-# Instancia del cliente de Feature Store
+# --- Tabla de Destino ---
+training_dataset_table_name = f"{catalog}.{database}.gold_inspection_training_dataset"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Creación del Conjunto de Entrenamiento
+# MAGIC
+# MAGIC Se inicializa el cliente del `Feature Store` y se definen los `lookups` para cada tabla de características.
+
+# COMMAND ----------
+
 fe = FeatureEngineeringClient()
 
-# Tabla spine
-spine_table = src_table
-
-# ===============================
-# CONVERTIR VISTAS A TABLAS ESTÁTICAS CON CONSTRAINTS
-# ===============================
-# Las tablas de características son vistas y no pueden tener constraints.
-# Convertimos cada vista a tabla estática.
-
-# 1. Crear tabla estática de gold_machine_profile
-machine_profile_table = f"{catalog}.{database}.gold_machine_profile_table"
-spark.sql(f"""
-CREATE OR REPLACE TABLE {machine_profile_table} AS
-SELECT * FROM {catalog}.{database}.gold_machine_profile
-""")
-
-# Asegurar que machine_id es NOT NULL
-spark.sql(f"""
-ALTER TABLE {machine_profile_table}
-ALTER COLUMN machine_id SET NOT NULL
-""")
-
-# Eliminar constraint si existe y crear nueva
-try:
-    spark.sql(f"ALTER TABLE {machine_profile_table} DROP CONSTRAINT gold_machine_profile_pk")
-except:
-    pass
-
-spark.sql(f"""
-ALTER TABLE {machine_profile_table}
-ADD CONSTRAINT gold_machine_profile_pk PRIMARY KEY (machine_id)
-""")
-
-print("Tablas estáticas creadas y constraints añadidas exitosamente.")
-
-# Definir los FeatureLookup para cada tabla de características (ahora usando tablas estáticas)
+# 1. Feature Lookup para el perfil estático de la máquina
 machine_profile_lookup = FeatureLookup(
-    table_name=machine_profile_table,
-    feature_names=["machine_type", "installation_date", "machine_age_days", 
-                   "nominal_cycle_time_s", "vibration_baseline_mm_s", 
-                   "wear_rate_pct_month", "clean_room_class", "line_capacity_units_day"],
-    lookup_key=["machine_id"]
+    table_name=machine_profile_table_name,
+    lookup_key="machine_id"
 )
 
+# 2. Feature Lookup para el perfil estático del proveedor
+supplier_profile_lookup = FeatureLookup(
+    table_name=supplier_profile_table_name,
+    lookup_key="supplier_id"
+)
 
-# ===============================
-# 2. CREAR TRAINING SET
-# ===============================
+# 3. Feature Lookup para las agregaciones dinámicas de la máquina (Point-in-Time)
+#    Se utiliza `timestamp_lookup_key` para asegurar la correctitud temporal.
+machine_aggregations_lookup = FeatureLookup(
+    table_name=machine_aggregations_table_name,
+    lookup_key="machine_id",
+    timestamp_lookup_key="timestamp"
+)
 
+# Lista de todos los lookups
+feature_lookups = [
+    machine_profile_lookup,
+    supplier_profile_lookup,
+    machine_aggregations_lookup
+]
 
-# Crear el training set
+# Cargar la tabla base (spine)
+spine_df = spark.table(spine_table_name)
+
+# Crear el conjunto de entrenamiento
+# El Feature Store se encarga de los joins Point-in-Time
 training_set = fe.create_training_set(
-    df=spark.table(spine_table),
-    feature_lookups=[machine_profile_lookup],
+    df=spine_df,
+    feature_lookups=feature_lookups,
     label="is_defective",
-    exclude_columns=["label_available_date"],
+    exclude_columns=["inspection_id"] # Excluimos el ID de inspección para no sobreajustar
 )
 
-# Materializa el DataFrame enriquecido
+# Materializar el DataFrame con todas las características
 training_df = training_set.load_df()
 
-# ===============================
-# 2. COMPROBACIONES DE CALIDAD
-# ===============================
-print(f"Filas en spine: {spark.table(spine_table).count()}")
-print(f"Filas en training_df: {training_df.count()}")
+print("Conjunto de datos de entrenamiento creado con éxito.")
+training_df.display()
 
-# Nulos por columna
-import pyspark.sql.functions as F
-nulls = training_df.select([F.count(F.when(F.col(c).isNull(), c)).alias(c) for c in training_df.columns])
-nulls.show(vertical=True, truncate=False)
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Validación y Persistencia
+# MAGIC
+# MAGIC Se realizan comprobaciones de calidad sobre el `DataFrame` resultante y se guarda como una tabla Delta final.
+
+# COMMAND ----------
+
+# DBTITLE 1,Validación de Nulos y Conteo
+print(f"Número de filas en el conjunto de entrenamiento: {training_df.count():,}")
+print(f"Número de columnas: {len(training_df.columns)}")
+
+# Comprobar nulos en columnas clave
+training_df.select([col(c).isNull().alias(c) for c in training_df.columns]).display()
 
 # Balance de clases
-training_df.groupBy("is_defective").count().show()
-
-
-
-
-# ===============================
-# 3. PERSISTENCIA DEL DATASET FINAL
-# ===============================
-final_table = f"{catalog}.{database}.gold_inspection_training_dataset"
-training_df.write.mode("overwrite").format("delta").saveAsTable(final_table)
-
-# Puedes añadir aquí la escritura de metadatos de trazabilidad si lo deseas
-
-# Asegura que unit_id es NOT NULL y añade la clave primaria (solo si no existe)
-spark.sql(f"""
-ALTER TABLE {dst_table}
-ALTER COLUMN unit_id SET NOT NULL
-""")
-
-# Elimina la constraint si ya existe, para evitar error de duplicado
-try:
-    spark.sql(f"ALTER TABLE {dst_table} DROP CONSTRAINT gold_inspection_spine_static_pk")
-except Exception as e:
-    if "does not exist" in str(e):
-        pass
-    elif "not found" in str(e):
-        pass
-    else:
-        raise
-
-spark.sql(f"""
-ALTER TABLE {dst_table}
-ADD CONSTRAINT gold_inspection_spine_static_pk PRIMARY KEY (unit_id)
-""")
+print("Balance de clases:")
+training_df.groupBy("is_defective").count().display()
 
 # COMMAND ----------
 
-catalog = "workspace"
-database = "ana_martin17"
+# DBTITLE 1,Guardar el Conjunto de Datos Final
+# Aumentar el timeout para la materialización de datasets grandes
+spark.conf.set("spark.databricks.execution.timeout", "3600") # 1 hora
 
-gold_spine_table = f"{catalog}.{database}.gold_inspection_spine"
-gold_machine_profile_table = f"{catalog}.{database}.gold_machine_profile"
-gold_supplier_profile_table = f"{catalog}.{database}.gold_supplier_profile"
-gold_machine_agg_1h_table = f"{catalog}.{database}.gold_machine_agg_1h"
-gold_machine_agg_24h_table = f"{catalog}.{database}.gold_machine_agg_24h"
+print(f"Guardando el conjunto de datos en la tabla: {training_dataset_table_name}")
 
-gold_training_dataset_table = f"{catalog}.{database}.gold_inspection_training_dataset"
-
-fe = FeatureEngineeringClient()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 2. Carga de la *spine*
-
-# COMMAND ----------
-
-spine_df = spark.table(gold_spine_table)
-print(f"Spine rows: {spine_df.count():,}")
-spine_df.printSchema()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 3. Feature Lookups
-# MAGIC
-# MAGIC Para aplicar correctitud temporal Point-in-Time (PiT), usaremos el campo `timestamp` de la transacción.
-
-# COMMAND ----------
-
-timestamp_key = "timestamp"
-
-# --- Perfil de Máquina ---
-machine_profile_lookups = FeatureLookup(
-    table_name=gold_machine_profile_table,
-    lookup_key="machine_id"
-    # Características estáticas no varían temporalmente normalmente, pero si
-    # se tiene un campo TIMESERIES en origen, Databricks asociará el histórico de cambios.
-)
-
-# --- Perfil de Proveedor ---
-supplier_profile_lookups = FeatureLookup(
-    table_name=gold_supplier_profile_table,
-    lookup_key="supplier_id"
-)
-
-# --- Agregaciones 1 Hora (máquina) ---
-machine_agg_1h_lookups = FeatureLookup(
-    table_name=gold_machine_agg_1h_table,
-    lookup_key="machine_id",
-    timestamp_lookup_key=timestamp_key
-)
-
-# --- Agregaciones 24 Horas (máquina) ---
-machine_agg_24h_lookups = FeatureLookup(
-    table_name=gold_machine_agg_24h_table,
-    lookup_key="machine_id",
-    timestamp_lookup_key=timestamp_key
-)
-
-feature_lookups = [
-    machine_profile_lookups,
-    supplier_profile_lookups,
-    machine_agg_1h_lookups,
-    machine_agg_24h_lookups
-]
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4. Creación del Training Dataset
-# MAGIC
-# MAGIC Excluimos también `label_available_date` (si existe en el spine o de los joins) ya que es una variable post-inspección (*delayed feedback*) que no tendríamos en inferencia.
-
-# COMMAND ----------
-
-# Create static copies of feature tables with primary keys
-# (Materialized views and streaming tables cannot have PK constraints)
-catalog = "workspace"
-database = "ana_martin17"
-
-# 1. Create static copy of gold_machine_profile (exclude line_id and ingestion_timestamp)
-machine_profile_static = f"{catalog}.{database}.gold_machine_profile_static"
-spark.sql(f"""
-CREATE OR REPLACE TABLE {machine_profile_static} AS
-SELECT 
-    machine_id,
-    machine_type,
-    installation_date,
-    machine_age_days,
-    nominal_cycle_time_s,
-    vibration_baseline_mm_s,
-    wear_rate_pct_month,
-    clean_room_class,
-    line_capacity_units_day
-FROM {catalog}.{database}.gold_machine_profile
-""")
-spark.sql(f"ALTER TABLE {machine_profile_static} ALTER COLUMN machine_id SET NOT NULL")
-try:
-    spark.sql(f"ALTER TABLE {machine_profile_static} DROP CONSTRAINT gold_machine_profile_static_pk")
-except:
-    pass
-spark.sql(f"ALTER TABLE {machine_profile_static} ADD CONSTRAINT gold_machine_profile_static_pk PRIMARY KEY (machine_id)")
-
-# 2. Create static copy of gold_supplier_profile (exclude ingestion_timestamp to avoid duplicates)
-supplier_profile_static = f"{catalog}.{database}.gold_supplier_profile_static"
-spark.sql(f"""
-CREATE OR REPLACE TABLE {supplier_profile_static} AS
-SELECT 
-    supplier_id,
-    supplier_name,
-    country,
-    onboarding_date,
-    solder_thickness_mean_um,
-    quality_rating,
-    is_new_supplier
-FROM {catalog}.{database}.gold_supplier_profile
-""")
-spark.sql(f"ALTER TABLE {supplier_profile_static} ALTER COLUMN supplier_id SET NOT NULL")
-try:
-    spark.sql(f"ALTER TABLE {supplier_profile_static} DROP CONSTRAINT gold_supplier_profile_static_pk")
-except:
-    pass
-spark.sql(f"ALTER TABLE {supplier_profile_static} ADD CONSTRAINT gold_supplier_profile_static_pk PRIMARY KEY (supplier_id)")
-
-# 3. Create static copy of gold_machine_agg_1h (PK only on machine_id for PIT joins, keep window_end for matching)
-machine_agg_1h_static = f"{catalog}.{database}.gold_machine_agg_1h_static"
-spark.sql(f"""
-CREATE OR REPLACE TABLE {machine_agg_1h_static} AS
-SELECT 
-    machine_id,
-    window_end,
-    window_size AS window_size_1h,
-    total_units AS total_units_1h,
-    defects AS defects_1h,
-    defect_rate AS defect_rate_1h,
-    avg_vibration AS avg_vibration_1h,
-    avg_tool_wear AS avg_tool_wear_1h,
-    avg_temperature AS avg_temperature_1h,
-    avg_solder_thickness AS avg_solder_thickness_1h,
-    avg_alignment_error AS avg_alignment_error_1h
-FROM {catalog}.{database}.gold_machine_agg_1h
-""")
-spark.sql(f"ALTER TABLE {machine_agg_1h_static} ALTER COLUMN machine_id SET NOT NULL")
-try:
-    spark.sql(f"ALTER TABLE {machine_agg_1h_static} DROP CONSTRAINT gold_machine_agg_1h_static_pk")
-except:
-    pass
-spark.sql(f"ALTER TABLE {machine_agg_1h_static} ADD CONSTRAINT gold_machine_agg_1h_static_pk PRIMARY KEY (machine_id)")
-
-# 4. For 24h, exclude window_end to avoid duplicate (only need one window_end column from 1h table)
-machine_agg_24h_static = f"{catalog}.{database}.gold_machine_agg_24h_static"
-spark.sql(f"""
-CREATE OR REPLACE TABLE {machine_agg_24h_static} AS
-SELECT 
-    machine_id,
-    window_size AS window_size_24h,
-    total_units AS total_units_24h,
-    defects AS defects_24h,
-    defect_rate AS defect_rate_24h,
-    avg_vibration AS avg_vibration_24h,
-    avg_tool_wear AS avg_tool_wear_24h,
-    avg_temperature AS avg_temperature_24h,
-    avg_solder_thickness AS avg_solder_thickness_24h,
-    avg_alignment_error AS avg_alignment_error_24h
-FROM {catalog}.{database}.gold_machine_agg_24h
-""")
-spark.sql(f"ALTER TABLE {machine_agg_24h_static} ALTER COLUMN machine_id SET NOT NULL")
-try:
-    spark.sql(f"ALTER TABLE {machine_agg_24h_static} DROP CONSTRAINT gold_machine_agg_24h_static_pk")
-except:
-    pass
-spark.sql(f"ALTER TABLE {machine_agg_24h_static} ADD CONSTRAINT gold_machine_agg_24h_static_pk PRIMARY KEY (machine_id)")
-
-print("Static feature tables with primary keys created successfully.")
-
-# Update feature lookups to use static tables
-machine_profile_lookups = FeatureLookup(
-    table_name=machine_profile_static,
-    lookup_key="machine_id"
-)
-
-supplier_profile_lookups = FeatureLookup(
-    table_name=supplier_profile_static,
-    lookup_key="supplier_id"
-)
-
-machine_agg_1h_lookups = FeatureLookup(
-    table_name=machine_agg_1h_static,
-    lookup_key="machine_id"
-)
-
-machine_agg_24h_lookups = FeatureLookup(
-    table_name=machine_agg_24h_static,
-    lookup_key="machine_id"
-)
-
-feature_lookups_static = [
-    machine_profile_lookups,
-    supplier_profile_lookups,
-    machine_agg_1h_lookups,
-    machine_agg_24h_lookups
-]
-
-# Now create the training set
-label = "is_defective"
-exclude_columns = ["label_available_date"]
-
-# Plan lógico
-training_dataset = fe.create_training_set(
-    df=spine_df,
-    feature_lookups=feature_lookups_static,
-    label=label,
-    exclude_columns=exclude_columns
-)
-
-# Materialización (Ejecución real de los Joins distribuidos)
-training_df = training_dataset.load_df()
-
-print(f"Training dataset columns: {len(training_df.columns)}")
-print("Training dataset created successfully.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 5. Validación y Balance de Clases
-
-# COMMAND ----------
-
-# DBTITLE 1,Untitled
-# Read from the materialized table instead of triggering joins again
-# This assumes cell 15 successfully wrote the table
-try:
-    materialized_df = spark.table(gold_training_dataset_table)
-    total_count = materialized_df.count()
-    
-    print(f"Total rows: {total_count:,}\n")
-    print("Class balance (Defects):")
-    
-    class_balance_df = (
-        materialized_df.groupBy(label)
-                      .count()
-                      .withColumn("pct", round(col("count") / total_count * 100, 2))
-                      .orderBy(label)
-    )
-    
-    class_balance_df.show()
-except Exception as e:
-    print(f"Table not yet materialized. Error: {str(e)}")
-    print("Please run cell 15 first to persist the training dataset.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 6. Persistencia y Trazabilidad
-
-# COMMAND ----------
-
-# DBTITLE 1,Cell 15 (Alternative: Manual Joins)
-# ALTERNATIVE APPROACH: Manual joins (often faster than Feature Engineering API)
-# This bypasses the FE API overhead for one-time materialization
-
-print("Using manual joins for faster materialization...\n")
-
-# Start with spine
-df_result = spine_df.filter("is_defective IS NOT NULL")
-
-print(f"Starting rows: {df_result.count():,}")
-
-# Join 1: Machine profile
-df_result = df_result.join(
-    spark.table(machine_profile_static),
-    "machine_id",
-    "left"
-)
-print("✓ Joined machine profile")
-
-# Join 2: Supplier profile  
-df_result = df_result.join(
-    spark.table(supplier_profile_static),
-    "supplier_id",
-    "left"
-)
-print("✓ Joined supplier profile")
-
-# Join 3: Machine agg 1h
-df_result = df_result.join(
-    spark.table(machine_agg_1h_static),
-    "machine_id",
-    "left"
-)
-print("✓ Joined 1h aggregations")
-
-# Join 4: Machine agg 24h
-df_result = df_result.join(
-    spark.table(machine_agg_24h_static),
-    "machine_id",
-    "left"
-)
-print("✓ Joined 24h aggregations")
-
-# Drop excluded columns
-if "label_available_date" in df_result.columns:
-    df_result = df_result.drop("label_available_date")
-
-# Optimize and write
-print("\nWriting to Delta table...")
-df_result.repartition(200).write \
-    .format("delta") \
-    .mode("overwrite") \
-    .option("overwriteSchema", "true") \
-    .option("delta.autoOptimize.optimizeWrite", "true") \
-    .saveAsTable(gold_training_dataset_table)
-
-print(f"\n✓ Training dataset materialized: {gold_training_dataset_table}")
-print(f"✓ Columns: {len(df_result.columns)}")
-print(f"✓ Row count: {spark.table(gold_training_dataset_table).count():,}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Cell 15
-# Increase timeout for large dataset materialization
-spark.conf.set("spark.databricks.execution.timeout", "14400")  # 4 hours
-
-print(f"Materializing training dataset with 30M spine rows...")
-print("Timeout increased to 4 hours. This operation may take 30-60 minutes.\n")
-
-# Filter nulls
-clean_training_df = training_df.filter("is_defective IS NOT NULL")
-
-# Repartition to optimize write performance
-optimized_df = clean_training_df.repartition(200)
-
-# Write with optimizations
-print("Starting write operation...")
 (
-    optimized_df
+    training_df
     .write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .option("delta.enableChangeDataFeed", "true")
-    .option("delta.autoOptimize.optimizeWrite", "true")
-    .option("delta.autoOptimize.autoCompact", "true")
-    .saveAsTable(gold_training_dataset_table)
+    .saveAsTable(training_dataset_table_name)
 )
 
-print(f"✓ Training dataset materialized: {gold_training_dataset_table}")
-final_count = spark.table(gold_training_dataset_table).count()
-print(f"✓ Row count: {final_count:,}")
+print("¡El conjunto de datos de entrenamiento ha sido guardado con éxito!")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. Conclusiones y Trazabilidad de MLflow
-# MAGIC Una vez generado este dataset inmutable, cualquier corrida de entrenamiento de Modelado usará `gold_inspection_training_dataset`. Podremos viajar en el tiempo a versiones físicas anteriores para asegurar estricta reproducibilidad de nuestros modelos Random Forest / XGBoost ante una auditoría.
+# MAGIC ## 5. Conclusión
+# MAGIC
+# MAGIC El conjunto de datos `gold_inspection_training_dataset` está ahora listo y materializado. Contiene todas las características necesarias, unidas con correctitud "point-in-time", y puede ser utilizado directamente por los notebooks de entrenamiento de modelos (`07_...` y `08_...`).
+# MAGIC
+# MAGIC Este enfoque no solo es más eficiente, sino también más robusto y fácil de mantener.

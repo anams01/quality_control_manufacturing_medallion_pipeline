@@ -43,7 +43,6 @@ from pyspark.ml import Pipeline
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.feature import (
     OneHotEncoder,
-    SQLTransformer,
     StandardScaler,
     StringIndexer,
     VarianceThresholdSelector,
@@ -240,20 +239,12 @@ def build_preprocessing_stages(
     Structural column lists and `SQL` statements are read from the `07_Utils.py`
     namespace. Hyperparameter values come exclusively from the function parameters.
     """
-    # 1. Rename numeric columns that have been imputed by the caller
-    # The imputation is now done via DataFrame.fillna() before the pipeline
-    # This step just renames columns with the _imp suffix
-    rename_expressions = ", ".join([f"{col} AS {col}_imp" for col in imputer_input_columns])
-    imputation_statement = f"SELECT *, {rename_expressions} FROM __THIS__"
-    imputation_transformer = SQLTransformer(statement = imputation_statement)
+    # IMPORTANT: SQLTransformer is not whitelisted in Databricks Spark Connect.
+    # Pre-pipeline transformations (imputation, boolean casting, feature engineering) 
+    # are applied as DataFrame operations in section 5.1 below, then the data is 
+    # passed through the pure MLlib pipeline (StringIndexer → OneHotEncoder → etc)
 
-    # 2. Boolean flags cast to DOUBLE with inline null imputation via COALESCE
-    boolean_transformer = SQLTransformer(statement = boolean_statement)
-
-    # 3. Feature engineering from current-transaction fields only
-    feature_engineer = SQLTransformer(statement = feature_engineering_statement)
-
-    # 4. Learn category vocabularies
+    # 1. Learn category vocabularies
     string_indexer = StringIndexer(
         inputCols = string_indexer_input_columns,
         outputCols = string_indexer_output_columns,
@@ -372,6 +363,17 @@ print(f"Training data imputed successfully. Rows: {train_weighted_imputed.count(
 
 # COMMAND ----------
 
+# 5.1 Pre-pipeline DataFrame transformations (replaces SQLTransformer since it's not whitelisted)
+# Apply column renaming for imputed numeric columns with _imp suffix
+rename_expressions = [F.col(col).alias(f"{col}_imp") for col in imputer_input_columns]
+other_cols = [F.col(col) for col in train_weighted_imputed.columns 
+              if col not in imputer_input_columns]
+train_renamed = train_weighted_imputed.select(rename_expressions + other_cols)
+
+print(f"Pre-pipeline transformations complete. Prepared data for ML pipeline.")
+
+# COMMAND ----------
+
 lr_clf = LogisticRegression(
     featuresCol = features_column,
     labelCol = label_column,
@@ -387,7 +389,7 @@ lr_clf = LogisticRegression(
 pipeline_stages = preprocessing_stages + [lr_clf]
 full_pipeline = Pipeline(stages = pipeline_stages)
 
-pipeline_model = full_pipeline.fit(train_weighted_imputed)
+pipeline_model = full_pipeline.fit(train_renamed)
 
 lr_fitted = pipeline_model.stages[-1]
 

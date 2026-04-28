@@ -526,30 +526,94 @@ print(f"Label column: {label_column}")
 
 # COMMAND ----------
 
-# 6. FIT LOGISTIC REGRESSION (No Pipeline - Direct Classifier)
+# 6. TRAIN LOGISTIC REGRESSION WITH SKLEARN (MLlib not available on Spark Connect)
+# Use stratified sampling to handle large dataset while maintaining class distribution
 
-lr_clf = LogisticRegression(
-    featuresCol = features_column,
-    labelCol = label_column,
-    weightCol = class_weight_column,
-    maxIter = max_iter,
-    regParam = reg_param,
-    elasticNetParam = elastic_net_param,
-    family = family,
-    standardization = standardization,
-    threshold = threshold
+print("\n" + "=" * 80)
+print("TRAINING LOGISTIC REGRESSION (Scikit-Learn - Spark Connect Compatible)")
+print("=" * 80)
+
+# Convert preprocessed Spark DataFrame to pandas with stratified sampling
+print(f"\nDataFrame size: {df_preprocessed.count():,} rows")
+print("Converting to pandas with stratified sampling (maintain class ratio)...")
+
+# Calculate sampling fraction to keep model training time reasonable
+# Target: 500K-1M rows for grid search (will train 9 models)
+target_size = 500000
+current_size = df_preprocessed.count()
+sample_fraction = min(1.0, target_size / current_size)
+
+print(f"Sample fraction: {sample_fraction:.4f} (target: {target_size:,} rows)")
+
+# Do stratified sampling by label to maintain class distribution
+df_sampled = df_preprocessed.sampleBy(label_column, fractions={0.0: sample_fraction, 1.0: sample_fraction}, seed=42)
+sampled_size = df_sampled.count()
+print(f"Sampled size: {sampled_size:,} rows")
+
+# Convert to pandas for sklearn training
+print("Converting Spark DataFrame to pandas...")
+pdf = df_sampled.select([features_column, label_column, class_weight_column]).toPandas()
+
+print(f"Pandas DataFrame shape: {pdf.shape}")
+print(f"Memory usage: {pdf.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
+
+# Extract features, labels, and weights
+X = pdf[features_column].apply(lambda x: np.array(x) if isinstance(x, list) else x).values
+X = np.array([np.array(xi, dtype=float) if hasattr(xi, '__iter__') else [float(xi)] for xi in X])
+y = pdf[label_column].values.astype(int)
+sample_weight = pdf[class_weight_column].values.astype(float)
+
+print(f"\nFeatures shape: {X.shape}")
+print(f"Labels shape: {y.shape}")
+print(f"Sample weights shape: {sample_weight.shape}")
+print(f"Class distribution: {np.bincount(y.astype(int))}")
+
+# Train Logistic Regression with sklearn
+from sklearn.linear_model import LogisticRegression as SklearnLR
+from sklearn.preprocessing import StandardScaler as SklearnStandardScaler
+
+print("\nTraining Logistic Regression (Scikit-Learn)...")
+
+# Fit scaler and scale features
+scaler = SklearnStandardScaler(with_mean=scaler_with_mean, with_std=scaler_with_std)
+X_scaled = scaler.fit_transform(X)
+
+# Train classifier
+lr_fitted = SklearnLR(
+    C=1.0/reg_param,  # sklearn uses C = 1/lambda
+    penalty='elasticnet' if elastic_net_param == 0.5 else 'l2',
+    solver='saga',  # supports elasticnet
+    l1_ratio=elastic_net_param if elastic_net_param > 0 else None,
+    max_iter=max_iter,
+    fit_intercept=True,
+    class_weight='balanced',
+    random_state=42,
+    n_jobs=-1,
+    verbose=1
 )
 
-# Fit LogisticRegression directly to preprocessed data (no pipeline)
-lr_fitted = lr_clf.fit(df_preprocessed)
+lr_fitted.fit(X_scaled, y, sample_weight=sample_weight)
 
-print("LogisticRegression trained successfully.")
-print(f"Total iterations: {lr_fitted.summary.totalIterations}")
+print(f"Logistic Regression trained successfully!")
+print(f"Coefficients shape: {lr_fitted.coef_.shape}")
+print(f"Intercept: {lr_fitted.intercept_}")
+print(f"Iterations needed: {lr_fitted.n_iter_}")
 
-# Wrap classifier in a Pipeline for compatibility with save/transform/MLflow
-pipeline_model = Pipeline(stages=[lr_fitted]).fit(df_preprocessed)
+# Create a simple wrapper to handle transform for compatibility
+class ScikitPipelineWrapper:
+    def __init__(self, scaler, classifier):
+        self.scaler = scaler
+        self.classifier = classifier
+    
+    def predict(self, X):
+        X_scaled = self.scaler.transform(X)
+        return self.classifier.predict(X_scaled)
+    
+    def predict_proba(self, X):
+        X_scaled = self.scaler.transform(X)
+        return self.classifier.predict_proba(X_scaled)
 
-print("Pipeline wrapper created for model serialization.")
+pipeline_model = ScikitPipelineWrapper(scaler, lr_fitted)
 
 # COMMAND ----------
 
@@ -565,9 +629,17 @@ run_tmp_path = str(Path(uc_volume_path) / "runs" / run_tag)
 model_save_path = str(Path(run_tmp_path) / "pipeline_model")
 dbutils.fs.mkdirs(model_save_path)
 
-pipeline_model.write().overwrite().save(model_save_path)
+# Save sklearn model using joblib
+import joblib
+model_pkl_path = str(Path(run_tmp_path) / "sklearn_model.pkl")
 
-print(f"Pipeline model successfully saved to {model_save_path}")
+joblib.dump(pipeline_model, model_pkl_path)
+print(f"Sklearn model successfully saved to {model_pkl_path}")
+
+# Also save scaler separately for reference
+scaler_pkl_path = str(Path(run_tmp_path) / "scaler.pkl")
+joblib.dump(scaler, scaler_pkl_path)
+print(f"Scaler successfully saved to {scaler_pkl_path}")
 
 # COMMAND ----------
 
@@ -587,7 +659,8 @@ print(f"Pipeline model successfully saved to {model_save_path}")
 expanded_feature_names = feature_cols_for_assembly  # Features before assembly
 selected_feature_names = feature_cols_for_assembly  # No variance filtering applied
 
-lr_coefficients = lr_fitted.coefficients.toArray().tolist()
+# Get coefficients from sklearn model
+lr_coefficients = lr_fitted.coef_[0].tolist() if hasattr(lr_fitted.coef_, 'tolist') else lr_fitted.coef_.tolist()
 
 print(f"Assembler input columns ({len(expanded_feature_names)}): {expanded_feature_names[:10]}... (showing first 10)")
 print(f"Selected features ({len(selected_feature_names)}): (same as above, no filtering)")
@@ -654,16 +727,27 @@ print(f"Logistic regression coefficients successfully saved to {coefficients_csv
 signature_sample_size = 5
 transform_buffer_size = 300
 
-input_example_pandas_df = train_weighted.limit(signature_sample_size).toPandas()
+# Get sample data for signature and examples (using Spark DataFrame)
+input_sample = train_weighted.limit(signature_sample_size).toPandas()
+eval_sample = train_weighted.limit(transform_buffer_size).toPandas()
 
-sample_predictions = pipeline_model.transform(train_weighted.limit(transform_buffer_size))
-output_example_pandas_df = (
-    to_pandas_predictions(sample_predictions)[[prob_fraud_column, prediction_column]].head(signature_sample_size)
-)
+# Extract features from eval sample for sklearn prediction
+X_eval = eval_sample[features_column].apply(lambda x: np.array(x) if isinstance(x, list) else x).values
+X_eval = np.array([np.array(xi, dtype=float) if hasattr(xi, '__iter__') else [float(xi)] for xi in X_eval])
 
-# Clean up residual Spark Connect metadata to avoid serialization issues
-clean_input_df = pd.DataFrame(input_example_pandas_df.to_dict("list"))
-clean_output_df = pd.DataFrame(output_example_pandas_df.to_dict("list"))
+# Get predictions from sklearn model
+y_pred_proba = pipeline_model.predict_proba(X_eval)  # Returns [[prob_0, prob_1], ...]
+y_pred = pipeline_model.predict(X_eval)
+
+# Create output dataframe
+output_example_df = pd.DataFrame({
+    prob_defective_column: y_pred_proba[:, 1],  # Probability of defect (class 1)
+    prediction_column: y_pred
+}).head(signature_sample_size)
+
+# Clean up to avoid serialization issues
+clean_input_df = pd.DataFrame(input_sample.to_dict("list"))
+clean_output_df = pd.DataFrame(output_example_df.to_dict("list"))
 
 input_example_path = str(Path(run_tmp_path) / "input_example.parquet")
 output_example_path = str(Path(run_tmp_path) / "output_example.parquet")
@@ -680,33 +764,26 @@ print(f"Output examples successfully saved to {output_example_path}")
 # MAGIC
 # MAGIC ## 9. Metadatos de convergencia del optimizador
 # MAGIC
-# MAGIC El atributo `objectiveHistory` contiene el valor de la función de pérdida (*loss function*) calculado al final de cada iteración por el optimizador matemático (habitualmente `L-BFGS`).
-# MAGIC
-# MAGIC Extraemos este historial como una lista nativa de `Python` para auditar si el modelo convergió de forma natural o si se detuvo prematuramente por alcanzar el límite máximo de iteraciones (`max_iter`).
+# MAGIC Con sklearn, podemos acceder al número de iteraciones requeridas para converger (`n_iter_`) 
+# MAGIC y al intercepto del modelo.
 
 # COMMAND ----------
 
-has_history = (
-    hasattr(lr_fitted, "summary")
-    and hasattr(lr_fitted.summary, "objectiveHistory")
-)
-
-objective_history = list(lr_fitted.summary.objectiveHistory) if has_history else []
-total_iterations = int(lr_fitted.summary.totalIterations) if has_history else max_iter
+# Get convergence metadata from sklearn model
+total_iterations = int(lr_fitted.n_iter_[0]) if hasattr(lr_fitted.n_iter_, '__iter__') else int(lr_fitted.n_iter_)
+converged = 1.0 if total_iterations < max_iter else 0.0  # Converged if didn't hit max_iter
 
 convergence_metadata = {
-    "objective_history": objective_history,
+    "objective_history": [],  # Sklearn doesn't track loss history by default
     "total_iterations": total_iterations,
-    "converged": float(len(objective_history) < max_iter) if has_history else 0.0,
-    "lr_intercept": float(lr_fitted.intercept)
+    "converged": float(converged),
+    "lr_intercept": float(lr_fitted.intercept_[0]) if hasattr(lr_fitted.intercept_, '__iter__') else float(lr_fitted.intercept_)
 }
 
-if has_history:
-    print(f"Initial loss: {objective_history[0]:.6f}")
-    print(f"Final loss: {objective_history[-1]:.6f}")
-    print(f"Converged: {bool(convergence_metadata['converged'])}")
-else:
-    print("Convergence history not available.")
+print(f"Total iterations: {total_iterations}")
+print(f"Max iterations: {max_iter}")
+print(f"Converged: {bool(converged)}")
+print(f"Intercept: {convergence_metadata['lr_intercept']:.6f}")
 
 # COMMAND ----------
 
@@ -714,13 +791,19 @@ else:
 # MAGIC
 # MAGIC ## 10. Liberación de memoria y retorno del resultado
 # MAGIC
-# MAGIC Como paso final, eliminamos explícitamente los objetos de `Spark` de mayor tamaño en memoria (conjunto de datos de entrenamiento, *pipeline* y el modelo) y forzamos la recolección de basura nativa de `Python` (`gc.collect()`). Esta práctica defensiva reduce drásticamente el riesgo de que la caché del clúster se sature antes de que termine la sesión.
-# MAGIC
-# MAGIC Finalmente, utilizamos `dbutils.notebook.exit` para devolver el control a la libreta orquestadora. Puesto que esta función solo admite cadenas de texto, empaquetamos todos los hiperparámetros y rutas de artefactos en un diccionario y lo serializamos a formato `.json`.
+# MAGIC Como paso final, eliminamos explícitamente los objetos grandes en memoria 
+# MAGIC (conjunto de datos de entrenamiento, modelos sklearn) y forzamos recolección de basura.
+# MAGIC Esta práctica defensiva reduce el riesgo de que la memoria se sature.
 
 # COMMAND ----------
 
-del training_data, pipeline_model, full_pipeline, lr_clf, preprocessing_stages, lr_fitted
+# Clean up large objects (sklearn model, dataframes, etc.)
+try:
+    del training_data, df_preprocessed, train_weighted, train_renamed, train_weighted_imputed
+    del lr_fitted, scaler, pipeline_model, X, y, sample_weight, pdf
+except:
+    pass
+
 gc.collect()
 
 result = {

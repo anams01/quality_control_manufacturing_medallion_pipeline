@@ -447,26 +447,34 @@ def _log_convergence_metrics(convergence_metadata, max_iter):
 
 def _log_pipeline_model(model_save_path, input_example_path, output_example_path):
     """
-    Load the model from the corresponding volume and log it.
+    Load the sklearn model from joblib and log it to MLflow.
 
     The model is loaded here, so the orchestrator session never needs
     to hold it in memory during the grid loop. The signature is inferred
-    from the `parquet` example files. The model is deleted from memory
-    immediately after logging to avoid cache pressure.
+    from the `parquet` example files.
 
-    Requires `MLFLOW_DFS_TMP` to be set to a `Unity Catalog` volume path,
-    as `Serverless` clusters cannot serialize `Spark ML` models without a
-    volume-backed temporary directory.
+    Requires `MLFLOW_DFS_TMP` to be set to a `Unity Catalog` volume path.
     """
-    pipeline_model = PipelineModel.load(model_save_path)
+    import joblib
+    
+    # Load sklearn model
+    model_file_path = model_save_path.replace("dbfs:", "/dbfs")
+    if model_file_path.endswith("/"):
+        model_file_path = model_file_path + "sklearn_model.pkl"
+    elif not model_file_path.endswith(".pkl"):
+        model_file_path = model_file_path + "/sklearn_model.pkl"
+    
+    pipeline_model = joblib.load(model_file_path)
     input_example = pd.read_parquet(input_example_path)
     output_example = pd.read_parquet(output_example_path)
     signature = infer_signature(input_example, output_example)
 
-    mlflow.spark.log_model(
-        spark_model = pipeline_model,
-        artifact_path = "pipeline_model",
-        signature = signature
+    # Log sklearn model
+    mlflow.sklearn.log_model(
+        sk_model = pipeline_model,
+        artifact_path = "sklearn_model",
+        signature = signature,
+        input_example = input_example
     )
 
     del pipeline_model

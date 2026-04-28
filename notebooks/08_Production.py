@@ -433,43 +433,52 @@ except Exception:
 
 if challenger_wins:
     try:
-        champion_pipeline = mlflow.spark.load_model(
-            f"runs:/{production_run_id}/champion_model"
-        )
-        (
-            champion_pipeline
-            .transform(test_df)
-            .withColumn(
-                prob_defective_column,
-                vector_to_array(F.col(probability_column)).getItem(1)
-            )
-            .withColumn(
-                prediction_column,
-                F.col(prediction_column).cast("long")
-            )
-            .withColumn(
-                model_version_col,
-                F.lit(final_version_number)
-            )
-            .withColumn(
-                inference_timestamp_col,
-                F.current_timestamp()
-            )
-            .select(
-                *test_df.columns,
-                prediction_column,
-                prob_defective_column,
-                model_version_col,
-                inference_timestamp_col
-            )
-            .write
-            .format("delta")
-            .mode("overwrite")
-            .option("overwriteSchema", "true")
-            .saveAsTable(baseline_table_name)
-        )
+        import joblib
+        import numpy as np
+        
+        # Load sklearn model from MLflow
+        champion_model_uri = f"runs:/{production_run_id}/sklearn_model"
+        
+        # Get the model artifact path
+        run_info = mlflow.get_run(production_run_id)
+        model_artifact_path = run_info.info.artifact_uri
+        
+        model_file_path = model_artifact_path.replace("dbfs:", "/dbfs")
+        if model_file_path.endswith("/"):
+            model_file_path = model_file_path + "sklearn_model.pkl"
+        elif not model_file_path.endswith(".pkl"):
+            model_file_path = model_file_path + "/sklearn_model.pkl"
+        
+        champion_pipeline = joblib.load(model_file_path)
+        
+        # Convert test_df to pandas and get predictions
+        test_pandas = test_df.select([features_column, label_column, *test_df.columns]).toPandas()
+        X_test = test_pandas[features_column].apply(lambda x: np.array(x) if isinstance(x, list) else x).values
+        X_test = np.array([np.array(xi, dtype=float) if hasattr(xi, '__iter__') else [float(xi)] for xi in X_test])
+        
+        # Get predictions
+        y_pred_proba = champion_pipeline.predict_proba(X_test)
+        y_pred = champion_pipeline.predict(X_test)
+        
+        # Create predictions dataframe
+        predictions_pdf = pd.DataFrame({
+            prob_defective_column: y_pred_proba[:, 1],
+            prediction_column: y_pred,
+            model_version_col: final_version_number,
+            inference_timestamp_col: pd.Timestamp.now(tz='UTC')
+        })
+        
+        # Combine with original test data
+        test_with_predictions = pd.concat([
+            test_pandas.reset_index(drop=True),
+            predictions_pdf.reset_index(drop=True)
+        ], axis=1)
+        
+        # Write to Delta table
+        spark.createDataFrame(test_with_predictions).write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(baseline_table_name)
+        
         print(f"Test baseline written to {baseline_table_name}")
-    except Exception:
+    except Exception as e:
         mlflow.set_tag("failure_stage", "baseline_write")
         mlflow.end_run(status = "FAILED")
         raise

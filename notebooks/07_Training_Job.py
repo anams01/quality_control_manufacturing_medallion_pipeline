@@ -42,7 +42,6 @@ import pandas as pd
 from pyspark.ml import Pipeline
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.feature import (
-    Imputer,
     OneHotEncoder,
     SQLTransformer,
     StandardScaler,
@@ -241,12 +240,12 @@ def build_preprocessing_stages(
     Structural column lists and `SQL` statements are read from the `07_Utils.py`
     namespace. Hyperparameter values come exclusively from the function parameters.
     """
-    # 1. Imputation for nullable numeric columns
-    imputer = Imputer(
-        inputCols = imputer_input_columns,
-        outputCols = imputer_output_columns,
-        strategy = imputer_strategy
-    )
+    # 1. Rename numeric columns that have been imputed by the caller
+    # The imputation is now done via DataFrame.fillna() before the pipeline
+    # This step just renames columns with the _imp suffix
+    rename_expressions = ", ".join([f"{col} AS {col}_imp" for col in imputer_input_columns])
+    imputation_statement = f"SELECT *, {rename_expressions} FROM __THIS__"
+    imputation_transformer = SQLTransformer(statement = imputation_statement)
 
     # 2. Boolean flags cast to DOUBLE with inline null imputation via COALESCE
     boolean_transformer = SQLTransformer(statement = boolean_statement)
@@ -293,7 +292,7 @@ def build_preprocessing_stages(
     )
 
     preprocessing_stages = [
-        imputer,
+        imputation_transformer,
         boolean_transformer,
         feature_engineer,
         string_indexer,
@@ -345,6 +344,34 @@ preprocessing_stages = build_preprocessing_stages(
     asm_handle_invalid = asm_handle_invalid
 )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC ### 5.1 Numeric Imputation (Spark Connect Compatible)
+# MAGIC
+# MAGIC Pre-compute median/mean values for numeric columns and apply imputation via DataFrame operations
+# MAGIC (avoids Py4J security restrictions on MLlib Imputer class).
+
+# COMMAND ----------
+
+# Calculate imputation values (median or mean) for numeric columns
+imputation_values = {}
+for col in imputer_input_columns:
+    if imputer_strategy == "median":
+        value = train_weighted.approxQuantile(col, [0.5], 0.05)[0]
+    else:  # mean
+        value = train_weighted.agg(F.avg(col)).collect()[0][0]
+    imputation_values[col] = value
+    print(f"Imputation value for {col} ({imputer_strategy}): {value}")
+
+# Apply imputation to training data
+train_weighted_imputed = train_weighted.fillna(imputation_values)
+
+print(f"Training data imputed successfully. Rows: {train_weighted_imputed.count():,}")
+
+# COMMAND ----------
+
 lr_clf = LogisticRegression(
     featuresCol = features_column,
     labelCol = label_column,
@@ -360,7 +387,7 @@ lr_clf = LogisticRegression(
 pipeline_stages = preprocessing_stages + [lr_clf]
 full_pipeline = Pipeline(stages = pipeline_stages)
 
-pipeline_model = full_pipeline.fit(train_weighted)
+pipeline_model = full_pipeline.fit(train_weighted_imputed)
 
 lr_fitted = pipeline_model.stages[-1]
 

@@ -226,18 +226,18 @@ def apply_string_indexing(df, categorical_cols):
     df_result = df
     
     for col_name in categorical_cols:
-        # Get unique values and create mapping
-        unique_vals = df_result.select(col_name).distinct().rdd.flatMap(lambda x: x).collect()
-        unique_vals = [v for v in unique_vals if v is not None]  # Remove nulls
+        # Get unique values and create mapping (no RDD - Spark Connect compatible)
+        unique_vals = [row[0] for row in df_result.select(col_name).distinct().collect() if row[0] is not None]
         value_to_idx = {v: i for i, v in enumerate(sorted(unique_vals))}
         
-        # Apply mapping via UDF
-        mapping_broadcast = None  # Will use local variable in UDF
+        # Apply mapping via UDF with closure (no broadcast needed)
+        num_cats = len(value_to_idx)
+        
         @udf(DoubleType())
-        def string_to_index(val):
+        def string_to_index(val, mapping=value_to_idx, num_categories=num_cats):
             if val is None:
-                return float(len(value_to_idx))  # Unknown value
-            return float(value_to_idx.get(val, len(value_to_idx)))
+                return float(num_categories)  # Unknown value
+            return float(mapping.get(val, num_categories))
         
         df_result = df_result.withColumn(f"{col_name}_idx", string_to_index(col(col_name)))
         index_mappings[col_name] = value_to_idx
@@ -434,16 +434,19 @@ for cat_col in categorical_columns:
     # Get unique values using DataFrame operations (no RDD - Spark Connect compatible)
     unique_vals = [row[0] for row in df_preprocessed.select(cat_col).distinct().collect() if row[0] is not None]
     
-    # Create UDF for indexing
+    # Create mapping dict for indexing
     mapping_dict = {v: float(i) for i, v in enumerate(sorted(unique_vals))}
     categorical_mappings[cat_col] = mapping_dict
     category_max_indices[cat_col] = len(mapping_dict) - 1  # For one-hot encoding
     
-    mapping_broadcast = spark.broadcast(mapping_dict)
+    # Create UDF that captures mapping_dict in closure (no broadcast needed for Spark Connect)
+    num_categories = len(mapping_dict)
     
     @udf(DoubleType())
-    def index_func(val):
-        return mapping_broadcast.value.get(val, float(len(mapping_broadcast.value)))
+    def index_func(val, mapping=mapping_dict, num_cats=num_categories):
+        if val is None:
+            return float(num_cats)  # Unknown/null value
+        return float(mapping.get(val, num_cats))
     
     df_preprocessed = df_preprocessed.withColumn(f"{cat_col}_idx", index_func(col(cat_col)))
     print(f"   - {cat_col}: {len(mapping_dict)} categories → indexed")

@@ -35,9 +35,19 @@ import gc
 import json
 from pathlib import Path
 
-import mlflow.spark
+import joblib
+import numpy as np
+import pandas as pd
 
-from sklearn.metrics import classification_report
+from sklearn.metrics import (
+    classification_report,
+    roc_auc_score,
+    average_precision_score,
+    f1_score,
+    recall_score,
+    precision_score,
+    accuracy_score,
+)
 
 # COMMAND ----------
 
@@ -59,7 +69,7 @@ dbutils.widgets.text("evaluation_tag", "train")
 
 model_artifact_uri = dbutils.widgets.get("model_artifact_uri")
 evaluation_dataset = dbutils.widgets.get("evaluation_dataset")
-evaluation_tag = dbutils.widgets.get("evaluation_tag")
+evaluation_tag     = dbutils.widgets.get("evaluation_tag")
 
 print(f"Model artifact URI: {model_artifact_uri}")
 print(f"Evaluation dataset: {evaluation_dataset}")
@@ -75,9 +85,9 @@ print(f"Evaluation tag: {evaluation_tag}")
 # MAGIC
 # MAGIC A diferencia del proceso de entrenamiento (que fusiona particiones para maximizar el aprendizaje), esta libreta actúa como un juez estricto. Utilizando el parámetro `evaluation_dataset`, seleccionará dinámicamente la partición correspondiente a la fase del ciclo de vida en curso:
 # MAGIC
-# MAGIC * **`train`**: Evalúa sobre el conjunto de entrenamiento (inspecciones de entrenamiento). Se utiliza para calcular la brecha de generalización junto con la evaluación sobre validación.
-# MAGIC * **`validation`**: Evalúa sobre el conjunto de validación (inspecciones no vistas durante entrenamiento). Es el modo estándar durante el *grid search* para seleccionar el mejor modelo sin contaminar el conjunto de prueba.
-# MAGIC * **`test`**: Evalúa sobre el conjunto de prueba (inspecciones completamente reservadas). Se reserva exclusivamente para la comparación final entre `challenger` y `champion` en la fase de producción.
+# MAGIC * **`train`**: Evalúa sobre el conjunto de entrenamiento. Se utiliza para calcular la brecha de generalización junto con la evaluación sobre validación.
+# MAGIC * **`validation`**: Evalúa sobre el conjunto de validación. Es el modo estándar durante el *grid search*.
+# MAGIC * **`test`**: Evalúa sobre el conjunto de prueba completamente reservado. Se reserva para la comparación final entre `challenger` y `champion`.
 
 # COMMAND ----------
 
@@ -97,18 +107,18 @@ print(dataset_description)
 
 # MAGIC %md
 # MAGIC
-# MAGIC ## 4. Carga del modelo y evaluación
+# MAGIC ## 4. Carga del modelo y generación de predicciones
 # MAGIC
-# MAGIC Se carga el modelo sklearn desde joblib (en lugar de MLflow Spark).
-# MAGIC A continuación, se aplica sobre la partición seleccionada para calcular las métricas.
+# MAGIC Se carga el `ScikitPipelineWrapper` guardado con `joblib` desde el volumen de `Unity Catalog`.
+# MAGIC A continuación, se aplica sobre la partición seleccionada para obtener probabilidades y predicciones.
 
 # COMMAND ----------
 
-import joblib
-import numpy as np
-
-# Load sklearn model from joblib
+# --- Resolver la ruta local del modelo ---
+# El artefacto puede llegar como "dbfs:/Volumes/..." o "/Volumes/..."
 model_file_path = model_artifact_uri.replace("dbfs:", "/dbfs")
+
+# Añadir el nombre del fichero si solo se recibe el directorio
 if model_file_path.endswith("/"):
     model_file_path = model_file_path + "sklearn_model.pkl"
 elif not model_file_path.endswith(".pkl"):
@@ -117,42 +127,68 @@ elif not model_file_path.endswith(".pkl"):
 pipeline_model = joblib.load(model_file_path)
 print(f"Model loaded from: {model_file_path}")
 
-# Convert eval_df to pandas and extract features
-eval_pandas_df = eval_df.select([features_column, label_column]).toPandas()
+# --- Convertir la partición a pandas y extraer features/labels ---
+# Solo se necesitan las columnas de features y label; el resto no es relevante aquí.
+eval_pandas_df = (
+    eval_df
+    .filter(F.col(label_column).isNotNull())   # Excluir inspecciones sin etiqueta (delayed feedback)
+    .select([features_column, label_column])
+    .toPandas()
+)
 
-# Extract features and labels
-X_eval = eval_pandas_df[features_column].apply(lambda x: np.array(x) if isinstance(x, list) else x).values
-X_eval = np.array([np.array(xi, dtype=float) if hasattr(xi, '__iter__') else [float(xi)] for xi in X_eval])
-y_eval = eval_pandas_df[label_column].values
+# Desempaquetar el vector de features (columna de listas) a matriz numpy
+X_eval = np.array(
+    [np.array(x, dtype=float) if hasattr(x, "__iter__") else [float(x)]
+     for x in eval_pandas_df[features_column].values]
+)
+y_eval = eval_pandas_df[label_column].values.astype(int)
 
-# Get predictions from sklearn model
-y_pred_proba = pipeline_model.predict_proba(X_eval)  # [[prob_0, prob_1], ...]
-y_pred = pipeline_model.predict(X_eval)
-p_eval = y_pred_proba[:, 1]  # Probability of defect (class 1)
+# --- Inferencia ---
+y_pred_proba = pipeline_model.predict_proba(X_eval)   # shape: (n, 2)
+y_pred       = pipeline_model.predict(X_eval)
+p_eval       = y_pred_proba[:, 1]                     # probabilidad de defecto (clase 1)
 
-# Create predictions dataframe in format expected by compute_metrics and visualizations
-predictions_df = pd.DataFrame({
-    label_column: y_eval,
-    prob_defective_column: p_eval,
-    prediction_column: y_pred
-})
-
-eval_metrics = compute_metrics(predictions_df)
-
-print(f"AUC-PR: {eval_metrics['auc_pr']:.4f}")
-print(f"AUC-ROC: {eval_metrics['auc_roc']:.4f}")
-print(f"F1-score: {eval_metrics['f1']:.4f}")
-print(f"Recall: {eval_metrics['recall']:.4f}")
-print(f"Precision: {eval_metrics['precision']:.4f}")
-print(f"Accuracy: {eval_metrics['accuracy']:.4f}")
+print(f"Evaluation set size: {len(y_eval):,} rows")
+print(f"Defective ratio: {y_eval.mean():.3%}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC
-# MAGIC ## 5. Umbral de decisión óptimo
+# MAGIC ## 5. Cálculo de métricas
 # MAGIC
-# MAGIC Se calcula el umbral de decisión óptimo mediante `find_best_threshold`. 
+# MAGIC Se calculan las métricas de clasificación directamente con `scikit-learn` sobre arrays numpy,
+# MAGIC evitando así cualquier dependencia con los evaluadores de `MLlib` (incompatibles con predicciones pandas).
+
+# COMMAND ----------
+
+# FIX: compute_metrics en 07_Utils.py usa BinaryClassificationEvaluator de MLlib,
+# que requiere un Spark DataFrame con columna "rawPrediction". Como aquí trabajamos
+# con sklearn/numpy, recalculamos las métricas directamente.
+
+eval_metrics = {
+    "auc_pr":    float(average_precision_score(y_eval, p_eval)),
+    "auc_roc":   float(roc_auc_score(y_eval, p_eval)),
+    "f1":        float(f1_score(y_eval, y_pred, zero_division=0)),
+    "recall":    float(recall_score(y_eval, y_pred, zero_division=0)),
+    "precision": float(precision_score(y_eval, y_pred, zero_division=0)),
+    "accuracy":  float(accuracy_score(y_eval, y_pred)),
+}
+
+print(f"AUC-PR:    {eval_metrics['auc_pr']:.4f}")
+print(f"AUC-ROC:   {eval_metrics['auc_roc']:.4f}")
+print(f"F1-score:  {eval_metrics['f1']:.4f}")
+print(f"Recall:    {eval_metrics['recall']:.4f}")
+print(f"Precision: {eval_metrics['precision']:.4f}")
+print(f"Accuracy:  {eval_metrics['accuracy']:.4f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC ## 6. Umbral de decisión óptimo
+# MAGIC
+# MAGIC Se calcula el umbral de decisión óptimo mediante `find_best_threshold`.
 # MAGIC Este umbral es el valor de corte sobre la probabilidad que maximiza el F1-score.
 
 # COMMAND ----------
@@ -160,46 +196,46 @@ print(f"Accuracy: {eval_metrics['accuracy']:.4f}")
 best_threshold, best_f1_score = find_best_threshold(y_eval, p_eval)
 
 print(f"Best threshold: {best_threshold:.2f}")
-print(f"Best F1-score: {best_f1_score:.4f}")
+print(f"Best F1-score:  {best_f1_score:.4f}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC
-# MAGIC ## 6. Generación y guardado de figuras
+# MAGIC ## 7. Generación y guardado de figuras
 # MAGIC
 # MAGIC Se generan las figuras de diagnóstico sobre la partición evaluada y se guardan como archivos `.png` en el volumen temporal de `Unity Catalog`.
 
 # COMMAND ----------
 
-eval_tmp_path = str(Path(uc_volume_path) / "evaluations" / evaluation_tag)
+eval_tmp_path   = str(Path(uc_volume_path) / "evaluations" / evaluation_tag)
 figures_local_path = str(Path(eval_tmp_path) / "figures")
 dbutils.fs.mkdirs(figures_local_path)
 
 save_diagnostic_figure(
-    fig_pr_curve(y_eval, p_eval, eval_metrics["auc_pr"], f"PR — {evaluation_tag} ({evaluation_dataset})"),
-    figures_local_path,
-    "pr_curve.png"
+    fig_pr_curve(y_eval, p_eval, eval_metrics["auc_pr"],
+                 f"PR — {evaluation_tag} ({evaluation_dataset})"),
+    figures_local_path, "pr_curve.png"
 )
 save_diagnostic_figure(
-    fig_roc_curve(y_eval, p_eval, eval_metrics["auc_roc"], f"ROC — {evaluation_tag} ({evaluation_dataset})"),
-    figures_local_path,
-    "roc_curve.png"
+    fig_roc_curve(y_eval, p_eval, eval_metrics["auc_roc"],
+                  f"ROC — {evaluation_tag} ({evaluation_dataset})"),
+    figures_local_path, "roc_curve.png"
 )
 save_diagnostic_figure(
-    fig_confusion_matrix(y_eval, y_pred, f"Confusion matrix — {evaluation_tag} ({evaluation_dataset})"),
-    figures_local_path,
-    "confusion_matrix.png"
+    fig_confusion_matrix(y_eval, y_pred,
+                         f"Confusion matrix — {evaluation_tag} ({evaluation_dataset})"),
+    figures_local_path, "confusion_matrix.png"
 )
 save_diagnostic_figure(
-    fig_calibration_curve(y_eval, p_eval, f"Calibration — {evaluation_tag} ({evaluation_dataset})"),
-    figures_local_path,
-    "calibration_curve.png"
+    fig_calibration_curve(y_eval, p_eval,
+                          f"Calibration — {evaluation_tag} ({evaluation_dataset})"),
+    figures_local_path, "calibration_curve.png"
 )
 save_diagnostic_figure(
-    fig_threshold_sweep(y_eval, p_eval, f"Threshold sweep — {evaluation_tag} ({evaluation_dataset})"),
-    figures_local_path,
-    "threshold_sweep.png"
+    fig_threshold_sweep(y_eval, p_eval,
+                        f"Threshold sweep — {evaluation_tag} ({evaluation_dataset})"),
+    figures_local_path, "threshold_sweep.png"
 )
 
 print("All diagnostic figures generated and saved successfully.")
@@ -208,7 +244,7 @@ print("All diagnostic figures generated and saved successfully.")
 
 # MAGIC %md
 # MAGIC
-# MAGIC ## 7. Informe de clasificación
+# MAGIC ## 8. Informe de clasificación
 # MAGIC
 # MAGIC La función `classification_report` genera una tabla detallada con *precision*, *recall* y *F1-score* desglosados por clase. El informe se guarda como fichero de texto plano (`.txt`) en el volumen de `Unity Catalog`.
 
@@ -219,7 +255,7 @@ target_names = ["Good", "Defective"]
 report_path = str(Path(eval_tmp_path) / "classification_report.txt")
 
 with open(report_path, "w") as fh:
-    fh.write(classification_report(y_eval, y_pred, target_names = target_names))
+    fh.write(classification_report(y_eval, y_pred, target_names=target_names))
 
 print(f"Classification report successfully saved to {report_path}")
 
@@ -227,23 +263,26 @@ print(f"Classification report successfully saved to {report_path}")
 
 # MAGIC %md
 # MAGIC
-# MAGIC ## 8. Liberación de memoria y retorno del resultado
+# MAGIC ## 9. Liberación de memoria y retorno del resultado
 # MAGIC
-# MAGIC Mismo patrón que en `07_Training_Job.ipynb`, devolviendo en este caso las métricas de evaluación y las rutas de los artefactos generados sobre la partición seleccionada.
+# MAGIC Mismo patrón que en `07_Training_Job.ipynb`, devolviendo en este caso las métricas de evaluación
+# MAGIC y las rutas de los artefactos generados sobre la partición seleccionada.
 
 # COMMAND ----------
 
-del eval_predictions, pipeline_model, lr_fitted
+# FIX: las variables originales (eval_predictions, lr_fitted) no existen en este notebook.
+# Solo se eliminan los objetos que sí se crearon aquí.
+del pipeline_model, X_eval, y_pred_proba, y_pred, p_eval, eval_pandas_df
 gc.collect()
 
 result = {
-    "evaluation_tag": evaluation_tag,
-    "evaluation_dataset": evaluation_dataset,
-    "eval_metrics": eval_metrics,
-    "figures_local_path": figures_local_path,
-    "report_path": report_path,
-    "best_threshold": best_threshold,
-    "best_f1_at_threshold": best_f1_score
+    "evaluation_tag":      evaluation_tag,
+    "evaluation_dataset":  evaluation_dataset,
+    "eval_metrics":        eval_metrics,
+    "figures_local_path":  figures_local_path,
+    "report_path":         report_path,
+    "best_threshold":      float(best_threshold),
+    "best_f1_at_threshold": float(best_f1_score),
 }
 
 print(f"Exiting notebook and returning results for evaluation: {evaluation_tag}")

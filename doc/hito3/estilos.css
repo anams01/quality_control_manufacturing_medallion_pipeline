@@ -1,0 +1,55 @@
+/* Configuración de página */
+@page {
+    size: A4;
+    margin: 2cm;
+}
+
+body {
+    font-family: "Times New Roman", Times, serif;
+    font-size: 11pt;
+    line-height: 1.5;
+    text-align: justify;
+}
+
+/* Centrar el título principal */
+h1 { 
+    font-size: 24pt; 
+    text-align: center; 
+    margin-bottom: 1em;
+    font-weight: bold;
+}
+
+h2 { font-size: 18pt; margin-top: 1.5em; border-bottom: 1px solid #ccc; }
+h3 { font-size: 14pt; margin-top: 1em; }
+
+/* Estilo de tablas profesional */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1.5em 0;
+}
+
+th, td {
+    border: 1px solid #999;
+    padding: 10px;
+    text-align: left;
+}
+
+th {
+    background-color: #f2f2f2;
+    font-weight: bold;
+}
+
+tr:nth-child(even) {
+    background-color: #fafafa;
+}
+
+/* Portada y saltos de página */
+.portada {
+    text-align: center;
+    margin-top: 150px;
+}
+
+.page-break {
+    page-break-after: always;
+}

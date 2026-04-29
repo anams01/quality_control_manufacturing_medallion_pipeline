@@ -13,8 +13,6 @@ Tablas generadas:
   - gold_machine_agg_30d  : métricas por máquina en ventana de 30 días
 """
 
-import pyspark.pipelines as dp
-from pyspark.sql import functions as F
 import dlt
 from pyspark.sql import Window
 from pyspark.sql.functions import (
@@ -30,126 +28,6 @@ SCHEMA_TABLES = "ana_martin17"
 WATERMARK     = "30 days"
 
 
-@dp.table(
-    name="gold_machine_agg_1h",
-    comment="Métricas de calidad por máquina en ventana de 1 hora. Para alertas en tiempo real.",
-    table_properties={"delta.enableChangeDataFeed": "true"},
-)
-def gold_machine_agg_1h():
-    return (
-        spark.readStream.table(f"{CATALOG}.{SCHEMA_TABLES}.silver_inspections_labeled")
-        .withWatermark("timestamp", WATERMARK)
-        .groupBy("machine_id", "line_id", F.window("timestamp", "1 hour"))
-        .agg(
-            F.count("unit_id").alias("total_units"),
-            F.sum("is_defective").alias("defects"),
-            F.mean("vibration_mm_s").alias("avg_vibration"),
-            F.mean("tool_wear_pct").alias("avg_tool_wear"),
-            F.mean("temperature_celsius").alias("avg_temperature"),
-            F.mean("solder_thickness_um").alias("avg_solder_thickness"),
-            F.mean("alignment_error_um").alias("avg_alignment_error"),
-        )
-        .select(
-            "machine_id", "line_id",
-            F.col("window.end").alias("window_end"),
-            F.lit("1h").alias("window_size"),
-            "total_units", "defects",
-            (F.col("defects") / F.col("total_units")).alias("defect_rate"),
-            "avg_vibration", "avg_tool_wear", "avg_temperature",
-            "avg_solder_thickness", "avg_alignment_error",
-            F.current_timestamp().alias("ingestion_timestamp"),
-        )
-    )
-
-
-@dp.table(
-    name="gold_machine_agg_24h",
-    comment="Métricas de calidad por máquina en ventana de 24 horas. Para tendencia diaria.",
-    table_properties={"delta.enableChangeDataFeed": "true"},
-)
-def gold_machine_agg_24h():
-    return (
-        spark.readStream.table(f"{CATALOG}.{SCHEMA_TABLES}.silver_inspections_labeled")
-        .withWatermark("timestamp", WATERMARK)
-        .groupBy("machine_id", "line_id", F.window("timestamp", "24 hours"))
-        .agg(
-            F.count("unit_id").alias("total_units"),
-            F.sum("is_defective").alias("defects"),
-            F.mean("vibration_mm_s").alias("avg_vibration"),
-            F.mean("tool_wear_pct").alias("avg_tool_wear"),
-            F.mean("temperature_celsius").alias("avg_temperature"),
-            F.mean("solder_thickness_um").alias("avg_solder_thickness"),
-            F.mean("alignment_error_um").alias("avg_alignment_error"),
-        )
-        .select(
-            "machine_id", "line_id",
-            F.col("window.end").alias("window_end"),
-            F.lit("24h").alias("window_size"),
-            "total_units", "defects",
-            (F.col("defects") / F.col("total_units")).alias("defect_rate"),
-            "avg_vibration", "avg_tool_wear", "avg_temperature",
-            "avg_solder_thickness", "avg_alignment_error",
-            F.current_timestamp().alias("ingestion_timestamp"),
-        )
-    )
-
-
-@dp.table(
-    name="gold_machine_agg_7d",
-    comment="Métricas de calidad por máquina en ventana de 7 días. Para tendencia semanal.",
-    table_properties={"delta.enableChangeDataFeed": "true"},
-)
-def gold_machine_agg_7d():
-    return (
-        spark.readStream.table(f"{CATALOG}.{SCHEMA_TABLES}.silver_inspections_labeled")
-        .withWatermark("timestamp", WATERMARK)
-        .groupBy("machine_id", "line_id", F.window("timestamp", "7 days"))
-        .agg(
-            F.count("unit_id").alias("total_units"),
-            F.sum("is_defective").alias("defects"),
-            F.mean("vibration_mm_s").alias("avg_vibration"),
-            F.mean("tool_wear_pct").alias("avg_tool_wear"),
-            F.mean("solder_thickness_um").alias("avg_solder_thickness"),
-        )
-        .select(
-            "machine_id", "line_id",
-            F.col("window.end").alias("window_end"),
-            F.lit("7d").alias("window_size"),
-            "total_units", "defects",
-            (F.col("defects") / F.col("total_units")).alias("defect_rate"),
-            "avg_vibration", "avg_tool_wear", "avg_solder_thickness",
-            F.current_timestamp().alias("ingestion_timestamp"),
-        )
-    )
-
-
-@dp.table(
-    name="gold_machine_agg_30d",
-    comment="Métricas de calidad por máquina en ventana de 30 días. Baseline mensual.",
-    table_properties={"delta.enableChangeDataFeed": "true"},
-)
-def gold_machine_agg_30d():
-    return (
-        spark.readStream.table(f"{CATALOG}.{SCHEMA_TABLES}.silver_inspections_labeled")
-        .withWatermark("timestamp", WATERMARK)
-        .groupBy("machine_id", "line_id", F.window("timestamp", "30 days"))
-        .agg(
-            F.count("unit_id").alias("total_units"),
-            F.sum("is_defective").alias("defects"),
-            F.mean("vibration_mm_s").alias("avg_vibration"),
-            F.mean("tool_wear_pct").alias("avg_tool_wear"),
-            F.mean("solder_thickness_um").alias("avg_solder_thickness"),
-        )
-        .select(
-            "machine_id", "line_id",
-            F.col("window.end").alias("window_end"),
-            F.lit("30d").alias("window_size"),
-            "total_units", "defects",
-            (F.col("defects") / F.col("total_units")).alias("defect_rate"),
-            "avg_vibration", "avg_tool_wear", "avg_solder_thickness",
-            F.current_timestamp().alias("ingestion_timestamp"),
-        )
-    )
 
 @dlt.table(
   name="gold_machine_aggregations",
@@ -179,6 +57,14 @@ def machine_aggregations():
     30*24: "30d"
   }
 
+  # Define all sensor columns to aggregate
+  sensor_columns = [
+    "temperature_celsius", "pressure_bar", "vibration_mm_s", "voltage_v", "current_ma",
+    "humidity_pct", "particle_count_m3", "solder_thickness_um", "alignment_error_um",
+    "optical_density", "tool_wear_pct", "time_since_maintenance_h", "production_speed_pct",
+    "operator_experience_yrs", "cycle_time_s"
+  ]
+
   # Iteratively add aggregated columns for each window
   agg_df = inspections_df
   for hours, name in windows.items():
@@ -189,10 +75,9 @@ def machine_aggregations():
         .rangeBetween(-hours * 3600, 0) # Window is from X hours ago to current event
     )
     
-    # Calculate aggregations over the window
-    agg_df = agg_df.withColumn(f"avg_temperature_{name}", avg("temperature").over(window_spec))
-    agg_df = agg_df.withColumn(f"avg_humidity_{name}", avg("humidity").over(window_spec))
-    agg_df = agg_df.withColumn(f"avg_power_consumption_{name}", avg("power_consumption").over(window_spec))
+    # Calculate aggregations for all sensor columns
+    for sensor_col in sensor_columns:
+      agg_df = agg_df.withColumn(f"avg_{sensor_col}_{name}", avg(sensor_col).over(window_spec))
     
     # Calculate defect rate over the window
     defective_sum = _sum(col("is_defective")).over(window_spec)
@@ -201,10 +86,15 @@ def machine_aggregations():
 
   # Select the final columns for the feature table
   # The primary keys are machine_id and timestamp, which are required for the Feature Store
-  final_columns = [
-    "machine_id",
-    "timestamp",
-    "inspection_id"
-  ] + [f"{agg}_{name}" for name in windows.values() for agg in ["avg_temperature", "avg_humidity", "avg_power_consumption", "defect_rate"]]
+  base_columns = ["machine_id", "timestamp", "inspection_id"]
+  
+  # Add all aggregated columns
+  aggregated_columns = []
+  for name in windows.values():
+    for sensor_col in sensor_columns:
+      aggregated_columns.append(f"avg_{sensor_col}_{name}")
+    aggregated_columns.append(f"defect_rate_{name}")
+  
+  final_columns = base_columns + aggregated_columns
   
   return agg_df.select(*final_columns)
